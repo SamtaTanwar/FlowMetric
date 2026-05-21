@@ -537,6 +537,9 @@ app.get(
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
     const employees = await prisma.user.findMany({
+      where: {
+  role: UserRole.EMPLOYEE,
+},
       include: {
         department: true,
         shift: true,
@@ -551,6 +554,9 @@ app.get(
         attendanceRecords: {
           orderBy: { date: "desc" },
           take: 1,
+        },
+        assignedWorkflows: {
+          select: { id: true },
         },
       },
       orderBy: { firstName: "asc" },
@@ -685,9 +691,9 @@ app.get(
     const session = await prisma.loginSession.findFirst({
       where: {
         userId: id,
-        loginAt: {
-          gte: today,
-        },
+        // loginAt: {
+        //   gte: today,
+        // },
       },
 
       orderBy: {
@@ -966,7 +972,7 @@ app.get(
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
     const users = await prisma.user.findMany({
-      where: { status: "ACTIVE" },
+      where: { status: "ACTIVE", role: UserRole.EMPLOYEE },
       include: {
         department: true,
         loginSessions: {
@@ -1009,6 +1015,7 @@ app.get(
       const activeEmployees = await prisma.loginSession.count({
         where: {
           status: SessionStatus.ACTIVE,
+          user: { role: UserRole.EMPLOYEE },
         },
       });
 
@@ -1020,6 +1027,7 @@ app.get(
             gte: today,
             lt: new Date(today.getTime() + 24 * 60 * 60 * 1000),
           },
+          user: { role: UserRole.EMPLOYEE },
         },
       });
 
@@ -1031,12 +1039,16 @@ app.get(
             gte: today,
             lt: new Date(today.getTime() + 24 * 60 * 60 * 1000),
           },
+          user: { role: UserRole.EMPLOYEE },
         },
       });
 
       // Average productivity today
       const productivityRecords = await prisma.productivityRecord.findMany({
-        where: { date: today },
+        where: {
+          date: today,
+          user: { role: UserRole.EMPLOYEE },
+        },
       });
 
       const avgProductivity =
@@ -1049,7 +1061,10 @@ app.get(
 
       // Attendance metrics today
       const attendanceRecords = await prisma.attendanceRecord.findMany({
-        where: { date: today },
+        where: {
+          date: today,
+          user: { role: UserRole.EMPLOYEE },
+        },
       });
 
       const presentCount = attendanceRecords.filter(
@@ -1081,7 +1096,10 @@ app.get(
 app.get("/api/productivity/summary", authenticate, asyncHandler(async (_req, res) => {
   const today = dayStart();
   const records = await prisma.productivityRecord.findMany({
-    where: { date: today },
+    where: {
+      date: today,
+      user: { role: UserRole.EMPLOYEE },
+    },
     include: { user: { include: { department: true } } },
     orderBy: { productivityPercent: "desc" },
   });
@@ -1376,18 +1394,29 @@ app.get(
     const date = dayStart(req.query.date ? String(req.query.date) : undefined);
     const [attendance, productivity, workflowCounts, activeSessions] = await Promise.all([
       prisma.attendanceRecord.findMany({
-        where: { date },
+        where: {
+          date,
+          user: { role: UserRole.EMPLOYEE },
+        },
         include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
       }),
       prisma.productivityRecord.findMany({
-        where: { date },
+        where: {
+          date,
+          user: { role: UserRole.EMPLOYEE },
+        },
         include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
       }),
       prisma.workflowTask.groupBy({
         by: ["status"],
         _count: { status: true },
       }),
-      prisma.loginSession.count({ where: { status: SessionStatus.ACTIVE } }),
+      prisma.loginSession.count({
+        where: {
+          status: SessionStatus.ACTIVE,
+          user: { role: UserRole.EMPLOYEE },
+        },
+      }),
     ]);
 
     res.json({
@@ -1406,6 +1435,7 @@ app.get(
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
     const records = await prisma.productivityRecord.findMany({
+      where: { user: { role: UserRole.EMPLOYEE } },
       include: { user: true },
       orderBy: { date: "desc" },
       take: 100,
