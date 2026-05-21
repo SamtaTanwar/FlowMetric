@@ -1,0 +1,14 @@
+//backend
+npm.cmd run prisma:generate
+npm.cmd run prisma:push
+npm.cmd run seed
+npm.cmd run dev
+
+//frontend
+npm.cmd run dev
+
+//login details
+Employee ID: EMP-1001
+Email: admin@worktrack.local
+Password: password123
+

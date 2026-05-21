@@ -1,0 +1,299 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  HR
+  EMPLOYEE
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum SessionStatus {
+  ACTIVE
+  COMPLETED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  HALF_DAY
+  ABSENT
+  LEAVE
+}
+
+enum WorkflowStatus {
+  TODO
+  IN_PROGRESS
+  REVIEW
+  COMPLETED
+  BLOCKED
+}
+
+enum WorkflowPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TrackingEventType {
+  KEYBOARD
+  MOUSE
+  SCREEN_LOCK
+  SCREEN_UNLOCK
+  IDLE_START
+  IDLE_END
+  BREAK_START
+  BREAK_END
+  APP_USAGE
+  LOGIN
+  LOGOUT
+}
+
+enum NotificationType {
+  IDLE_ALERT
+  LATE_LOGIN
+  LOGOUT_REMINDER
+  ATTENDANCE_WARNING
+  PRODUCTIVITY_ALERT
+  ADMIN_ANNOUNCEMENT
+  REPORT_READY
+}
+
+enum NotificationPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model Department {
+  id          Int     @id @default(autoincrement())
+  name        String
+  description String?
+
+  users     User[]
+  workflows WorkflowTask[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Shift {
+  id               Int    @id @default(autoincrement())
+  shiftName        String
+  startTime        String
+  endTime          String
+  breakMinutes     Int
+  graceMinutes     Int
+  minimumWorkHours Float
+
+  users User[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model WorkPolicy {
+  id                    Int     @id @default(autoincrement())
+  name                  String  @unique
+  allowedIdleMinutes    Int
+  breakAllowanceMinutes Int
+  graceMinutes          Int
+  minimumWorkHours      Float
+  overtimeAfterHours    Float
+  isDefault             Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model User {
+  id           Int        @id @default(autoincrement())
+  employeeCode String     @unique
+  firstName    String
+  lastName     String
+  email        String     @unique
+  phone        String?
+  passwordHash String
+  role         UserRole   @default(EMPLOYEE)
+  status       UserStatus @default(ACTIVE)
+  designation  String?
+  profileImage String?
+  lastLoginAt  DateTime?
+
+  departmentId Int?
+  shiftId      Int?
+
+  department Department? @relation(fields: [departmentId], references: [id])
+  shift      Shift?      @relation(fields: [shiftId], references: [id])
+
+  loginSessions       LoginSession[]
+  trackingEvents      TrackingEvent[]
+  productivityRecords ProductivityRecord[]
+  attendanceRecords   AttendanceRecord[]
+  notifications       Notification[]
+  assignedWorkflows   WorkflowTask[]       @relation("AssignedWorkflows")
+  createdWorkflows    WorkflowTask[]       @relation("CreatedWorkflows")
+  auditLogs           AuditLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model LoginSession {
+  id                Int           @id @default(autoincrement())
+  userId            Int
+  loginAt           DateTime      @default(now())
+  logoutAt          DateTime?
+  status            SessionStatus @default(ACTIVE)
+  deviceInfo        String?
+  ipAddress         String?
+  activeMinutes     Int           @default(0)
+  idleMinutes       Int           @default(0)
+  breakMinutes      Int           @default(0)
+  lockMinutes       Int           @default(0)
+  productiveMinutes Int           @default(0)
+
+  user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events TrackingEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([loginAt])
+}
+
+model TrackingEvent {
+  id              Int               @id @default(autoincrement())
+  userId          Int
+  sessionId       Int?
+  type            TrackingEventType
+  occurredAt      DateTime          @default(now())
+  durationSeconds Int?
+  appName         String?
+  windowTitle     String?
+  metadata        Json?
+
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session LoginSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, occurredAt])
+  @@index([sessionId])
+}
+
+model ProductivityRecord {
+  id                  Int      @id @default(autoincrement())
+  userId              Int
+  date                DateTime
+  loginMinutes        Int      @default(0)
+  activeMinutes       Int      @default(0)
+  idleMinutes         Int      @default(0)
+  breakMinutes        Int      @default(0)
+  productiveMinutes   Int      @default(0)
+  productivityPercent Float    @default(0)
+  score               Float    @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+  @@index([date])
+}
+
+model AttendanceRecord {
+  id                   Int              @id @default(autoincrement())
+  userId               Int
+  date                 DateTime
+  status               AttendanceStatus @default(PRESENT)
+  loginAt              DateTime?
+  logoutAt             DateTime?
+  lateMinutes          Int              @default(0)
+  earlyLogoutMinutes   Int              @default(0)
+  overtimeMinutes      Int              @default(0)
+  idleDeductionMinutes Int              @default(0)
+  remarks              String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+  @@index([date])
+  @@index([status])
+}
+
+model WorkflowTask {
+  id             Int              @id @default(autoincrement())
+  title          String
+  description    String?
+  status         WorkflowStatus   @default(TODO)
+  priority       WorkflowPriority @default(MEDIUM)
+  dueDate        DateTime?
+  estimatedHours Float?
+  actualHours    Float?
+  completedAt    DateTime?
+
+  assignedToId Int?
+  createdById  Int?
+  departmentId Int?
+
+  assignedTo User?       @relation("AssignedWorkflows", fields: [assignedToId], references: [id], onDelete: SetNull)
+  createdBy  User?       @relation("CreatedWorkflows", fields: [createdById], references: [id], onDelete: SetNull)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([assignedToId])
+}
+
+model Notification {
+  id        Int                  @id @default(autoincrement())
+  userId    Int?
+  type      NotificationType
+  priority  NotificationPriority @default(MEDIUM)
+  title     String
+  message   String
+  isRead    Boolean              @default(false)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@index([type])
+}
+
+model AuditLog {
+  id       Int     @id @default(autoincrement())
+  actorId  Int?
+  action   String
+  entity   String
+  entityId String?
+  metadata Json?
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([entity])
+}
