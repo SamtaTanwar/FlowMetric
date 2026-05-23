@@ -1,12 +1,36 @@
 {
-  "name": "frontend",
+  "name": "employee-workflow-tracking",
   "version": "0.1.0",
   "private": true,
+  "main": "electron.js",
+  "description": "Employee Workflow Tracking Desktop App",
+  "author": "Nandni",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "electron": "electron .",
+    "electron-dev": "node scripts/electron-dev.js",
+    "prepare-electron-app": "node scripts/prepare-electron-app.js",
+    "dist": "npm run build && npm run prepare-electron-app && node scripts/build-electron.js"
+  },
+  "build": {
+    "appId": "com.employee.workflow",
+    "productName": "Employee Workflow Tracking",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron.js",
+      "package.json",
+      "out/**/*"
+    ],
+    "win": {
+      "target": "portable",
+      "signAndEditExecutable": false
+    }
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",
@@ -30,6 +54,8 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "electron": "^42.2.0",
+    "electron-builder": "^26.8.1",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",

@@ -1,0 +1,7 @@
+frontend/dist/
+frontend/.electron-app/
+frontend/.next/
+frontend/out/
+frontend-dev-*.log
+backend-runtime-*.log
+*.log

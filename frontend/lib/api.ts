@@ -13,6 +13,7 @@ export type StoredUser = {
 const TOKEN_KEY = "ewtpma_token";
 const USER_KEY = "ewtpma_user";
 const SESSION_KEY = "ewtpma_session_id";
+const NAVIGATION_KEY = "ewtpma_allowed_route";
 
 function browserStorage() {
   if (typeof window === "undefined") {
@@ -53,6 +54,44 @@ export function storeAuth(token: string, user: StoredUser) {
   
 }
 
+export function allowProtectedNavigation(path: string) {
+  browserStorage()?.setItem(
+    NAVIGATION_KEY,
+    JSON.stringify({
+      path,
+      expiresAt: Date.now() + 15000,
+    }),
+  );
+}
+
+export function consumeProtectedNavigation(path: string) {
+  const storage = browserStorage();
+
+  if (!storage) {
+    return false;
+  }
+
+  const raw = storage.getItem(NAVIGATION_KEY);
+
+  if (!raw) {
+    return false;
+  }
+
+  try {
+    const allowed = JSON.parse(raw) as { path?: string; expiresAt?: number };
+    const isAllowed = allowed.path === path && Number(allowed.expiresAt) > Date.now();
+
+    if (!isAllowed) {
+      storage.removeItem(NAVIGATION_KEY);
+    }
+
+    return isAllowed;
+  } catch {
+    storage.removeItem(NAVIGATION_KEY);
+    return false;
+  }
+}
+
 export function clearAuth() {
   const storage = browserStorage();
 
@@ -63,6 +102,7 @@ export function clearAuth() {
   storage.removeItem(TOKEN_KEY);
   storage.removeItem(USER_KEY);
   storage.removeItem(SESSION_KEY);
+  storage.removeItem(NAVIGATION_KEY);
 }
 
 export function storeSessionId(sessionId: number) {
@@ -133,10 +173,12 @@ export async function downloadApiFile(path: string, fileName: string) {
   }
 
   const blob = await response.blob();
+  const contentDisposition = response.headers.get("content-disposition") || "";
+  const serverFileName = contentDisposition.match(/filename="?([^"]+)"?/)?.[1];
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = fileName;
+  link.download = serverFileName || fileName;
   document.body.appendChild(link);
   link.click();
   link.remove();

@@ -42,11 +42,11 @@ export default function AnimatedInput({
           className="min-w-0 flex-1 bg-transparent text-base text-white outline-none placeholder:text-slate-400"
           onFocus={(e) => {
             setFocused(true);
-            props.onFocus?.(e as any);
+            props.onFocus?.(e);
           }}
           onBlur={(e) => {
             setFocused(false);
-            props.onBlur?.(e as any);
+            props.onBlur?.(e);
           }}
           type={isPassword ? (show ? "text" : "password") : props.type}
         />

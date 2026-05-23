@@ -3,7 +3,12 @@
 import { motion } from "framer-motion";
 import React from "react";
 
-export default function MagicButton({ children, loading = false, ...props }: any) {
+type MagicButtonProps = Omit<React.ComponentProps<typeof motion.button>, "children"> & {
+  children: React.ReactNode;
+  loading?: boolean;
+};
+
+export default function MagicButton({ children, loading = false, ...props }: MagicButtonProps) {
   return (
     <motion.button
       whileTap={{ scale: 0.98 }}

@@ -1,11 +1,12 @@
 "use client";
 
-import { ArrowRight, Mail, Zap, Shield, Lock } from "lucide-react";
+import { ArrowLeft, ArrowRight, Mail } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
-import { apiRequest, storeAuth } from "@/lib/api";
+import { allowProtectedNavigation, apiRequest, storeAuth } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
 
 import AnimatedGrid from "../components/AnimatedGrid";
@@ -13,7 +14,6 @@ import FloatingOrbs from "../components/FloatingOrbs";
 import CursorEffects from "../components/CursorEffects";
 import AnimatedInput from "../components/AnimatedInput";
 import MagicButton from "../components/MagicButton";
-import SecurityBadge from "../components/SecurityBadge";
 
 type LoginResponse = {
   message: string;
@@ -23,7 +23,6 @@ type LoginResponse = {
 
 export default function LoginPage() {
   const router = useRouter();
-  const cardRef = useRef<HTMLDivElement | null>(null);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -63,6 +62,7 @@ export default function LoginPage() {
           ? "/dashboard"
           : "/employee";
 
+      allowProtectedNavigation(destination);
       router.replace(destination);
       // window.location.assign(destination);
     } catch (error) {
@@ -128,6 +128,14 @@ export default function LoginPage() {
       <AnimatedGrid />
       <FloatingOrbs />
       <CursorEffects />
+
+      <Link
+        aria-label="Back to home"
+        className="fixed right-5 top-5 z-[60] flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] text-slate-200 shadow-2xl shadow-black/20 backdrop-blur-2xl transition hover:border-cyan-300/30 hover:bg-cyan-300/10 hover:text-cyan-100"
+        href="/"
+      >
+        <ArrowLeft size={19} />
+      </Link>
 
       {/* Enhanced animated background gradients */}
       <motion.div

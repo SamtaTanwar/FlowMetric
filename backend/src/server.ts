@@ -30,6 +30,7 @@ const io = new Server(httpServer, {
 const prisma = new PrismaClient();
 const jwtSecret = process.env.JWT_SECRET || "employee_workflow_secret_key";
 const adminLikeRoles: UserRole[] = [UserRole.ADMIN, UserRole.MANAGER, UserRole.HR];
+const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
 
 type AuthUser = {
   id: number;
@@ -151,6 +152,99 @@ function productivityPercent(productiveMinutes: number, loginMinutes: number) {
   }
 
   return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
+}
+
+function productiveMinutesWithBreakAllowance(
+  loginMinutes: number,
+  idleMinutes: number,
+  breakMinutes: number,
+  breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES,
+) {
+  const excessBreakMinutes = Math.max(0, breakMinutes - breakAllowanceMinutes);
+  return Math.max(0, loginMinutes - idleMinutes - excessBreakMinutes);
+}
+
+async function getBreakAllowanceMinutes() {
+  const policy = await prisma.workPolicy.findFirst({
+    orderBy: [{ isDefault: "desc" }, { name: "asc" }],
+    select: { breakAllowanceMinutes: true },
+  });
+
+  return policy?.breakAllowanceMinutes ?? DEFAULT_BREAK_ALLOWANCE_MINUTES;
+}
+
+function csvCell(value: unknown) {
+  const text = value == null ? "" : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function csvRow(values: unknown[]) {
+  return values.map(csvCell).join(",");
+}
+
+function workflowStatusFromProgress(actualHours: number, estimatedHours?: number | null) {
+  if (!estimatedHours || estimatedHours <= 0) {
+    return WorkflowStatus.IN_PROGRESS;
+  }
+
+  const progress = (actualHours / estimatedHours) * 100;
+
+  if (progress >= 100) {
+    return WorkflowStatus.COMPLETED;
+  }
+
+  if (progress >= 80) {
+    return WorkflowStatus.REVIEW;
+  }
+
+  return WorkflowStatus.IN_PROGRESS;
+}
+
+async function applyProductiveTimeToWorkflows(userId: number, productiveMinutes: number) {
+  if (productiveMinutes <= 0) {
+    return [];
+  }
+
+  const workflows = await prisma.workflowTask.findMany({
+    where: {
+      assignedToId: userId,
+      status: {
+        in: [WorkflowStatus.TODO, WorkflowStatus.IN_PROGRESS, WorkflowStatus.REVIEW],
+      },
+    },
+    orderBy: [
+      { dueDate: "asc" },
+      { updatedAt: "asc" },
+    ],
+  });
+
+  if (workflows.length === 0) {
+    return [];
+  }
+
+  const addedHoursPerWorkflow = productiveMinutes / 60 / workflows.length;
+
+  const updates = await Promise.all(
+    workflows.map((workflow) => {
+      const nextActualHours = Number(
+        ((workflow.actualHours ?? 0) + addedHoursPerWorkflow).toFixed(2),
+      );
+      const nextStatus = workflowStatusFromProgress(nextActualHours, workflow.estimatedHours);
+
+      return prisma.workflowTask.update({
+        where: { id: workflow.id },
+        data: {
+          actualHours: nextActualHours,
+          status: nextStatus,
+          completedAt: nextStatus === WorkflowStatus.COMPLETED ? new Date() : null,
+        },
+      });
+    }),
+  );
+
+  updates.forEach((workflow) => io.emit("workflow-updated", workflow));
+
+  return updates;
 }
 
 function monthRange(date = new Date()) {
@@ -369,7 +463,13 @@ async function finalizeSession(
   const activeMinutes =
     input.activeMinutes ?? Math.max(0, loginMinutes - idleMinutes - breakMinutes);
   const lockMinutes = input.lockMinutes ?? session.lockMinutes;
-  const productiveMinutes = Math.max(0, loginMinutes - idleMinutes - breakMinutes);
+  const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+  const productiveMinutes = productiveMinutesWithBreakAllowance(
+    loginMinutes,
+    idleMinutes,
+    breakMinutes,
+    breakAllowanceMinutes,
+  );
   const date = dayStart(session.loginAt);
 
   const updatedSession = await prisma.loginSession.update({
@@ -414,6 +514,11 @@ async function finalizeSession(
     },
   });
 
+  const updatedWorkflows = await applyProductiveTimeToWorkflows(
+    session.userId,
+    productiveMinutes,
+  );
+
   await prisma.attendanceRecord.updateMany({
     where: {
       userId: session.userId,
@@ -437,9 +542,13 @@ async function finalizeSession(
     },
   });
 
-  io.emit("session-stopped", { session: updatedSession, productivity: record });
+  io.emit("session-stopped", {
+    session: updatedSession,
+    productivity: record,
+    workflows: updatedWorkflows,
+  });
 
-  return { session: updatedSession, productivity: record };
+  return { session: updatedSession, productivity: record, workflows: updatedWorkflows };
 }
 
 app.get("/", (_req, res) => {
@@ -1039,17 +1148,15 @@ app.get(
         60000
     );
 
-    const productiveMinutes =
-      Math.max(0, totalMinutes - idleMinutes - session.breakMinutes);
+    const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+    const productiveMinutes = productiveMinutesWithBreakAllowance(
+      totalMinutes,
+      idleMinutes,
+      session.breakMinutes,
+      breakAllowanceMinutes,
+    );
 
-    const productivity =
-      totalMinutes > 0
-        ? Math.round(
-            (productiveMinutes /
-              totalMinutes) *
-              100
-          )
-        : 0;
+    const productivity = productivityPercent(productiveMinutes, totalMinutes);
 
     res.json({
       loginTime: session.loginAt,
@@ -1194,11 +1301,31 @@ app.get(
           },
         });
 
+      const latestIdleEvent =
+        await prisma.trackingEvent.findFirst({
+          where: {
+            sessionId: activeSession.id,
+            type: {
+              in: ["IDLE_START", "IDLE_END"],
+            },
+          },
+
+          orderBy: {
+            createdAt: "desc",
+          },
+        });
+
       res.json({
         activeSession,
+        breakStartedAt:
+          latestBreakEvent?.type === "BREAK_START" ? latestBreakEvent.createdAt : null,
+        idleStartedAt:
+          latestIdleEvent?.type === "IDLE_START" ? latestIdleEvent.createdAt : null,
 
         isOnBreak:
           latestBreakEvent?.type === "BREAK_START",
+        isIdle:
+          latestIdleEvent?.type === "IDLE_START",
       });
     } catch (error) {
       console.error(error);
@@ -1332,6 +1459,7 @@ app.get(
   async (req: any, res) => {
     try {
       const today = dayStart();
+      const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
       
       // Total employees count (all roles)
       const totalEmployees = await prisma.user.count({
@@ -1340,13 +1468,38 @@ app.get(
         },
       });
 
-      // Active employees (have active login sessions today)
-      const activeEmployees = await prisma.loginSession.count({
-        where: {
-          status: SessionStatus.ACTIVE,
-          user: { role: UserRole.EMPLOYEE },
-        },
-      });
+      const [sessionsToday, productivityRecords, breakAllowanceMinutes] = await Promise.all([
+        prisma.loginSession.findMany({
+          where: {
+            loginAt: {
+              gte: today,
+              lt: tomorrow,
+            },
+            user: { role: UserRole.EMPLOYEE },
+          },
+          orderBy: { loginAt: "desc" },
+        }),
+        prisma.productivityRecord.findMany({
+          where: {
+            date: today,
+            user: { role: UserRole.EMPLOYEE },
+          },
+        }),
+        getBreakAllowanceMinutes(),
+      ]);
+
+      const latestSessionByUser = new Map<number, (typeof sessionsToday)[number]>();
+
+      for (const session of sessionsToday) {
+        if (!latestSessionByUser.has(session.userId)) {
+          latestSessionByUser.set(session.userId, session);
+        }
+      }
+
+      const loggedInUserIds = new Set(sessionsToday.map((session) => session.userId));
+      const activeEmployees = Array.from(latestSessionByUser.values()).filter(
+        (session) => session.status === SessionStatus.ACTIVE,
+      ).length;
 
       // Employees on break today
       const breakEmployees = await prisma.trackingEvent.count({
@@ -1372,33 +1525,38 @@ app.get(
         },
       });
 
-      // Average productivity today
-      const productivityRecords = await prisma.productivityRecord.findMany({
-        where: {
-          date: today,
-          user: { role: UserRole.EMPLOYEE },
-        },
-      });
+      const productivityByUser = new Map(
+        productivityRecords.map((record) => [record.userId, record.productivityPercent]),
+      );
+      const productivityValues = Array.from(loggedInUserIds).map((userId) => {
+        const storedPercent = productivityByUser.get(userId);
 
+        if (typeof storedPercent === "number") {
+          return storedPercent;
+        }
+
+        const session = latestSessionByUser.get(userId);
+
+        if (!session) {
+          return 0;
+        }
+
+        const endTime = session.logoutAt || new Date();
+        const loginMinutes = minutesBetween(session.loginAt, endTime);
+        const productiveMinutes = productiveMinutesWithBreakAllowance(
+          loginMinutes,
+          session.idleMinutes,
+          session.breakMinutes,
+          breakAllowanceMinutes,
+        );
+
+        return productivityPercent(productiveMinutes, loginMinutes);
+      });
       const avgProductivity =
-        productivityRecords.length > 0
-          ? Math.round(
-              productivityRecords.reduce((sum, record) => sum + record.productivityPercent, 0) /
-                productivityRecords.length
-            )
+        productivityValues.length > 0
+          ? Math.round(productivityValues.reduce((sum, value) => sum + value, 0) / productivityValues.length)
           : 0;
-
-      // Attendance metrics today
-      const attendanceRecords = await prisma.attendanceRecord.findMany({
-        where: {
-          date: today,
-          user: { role: UserRole.EMPLOYEE },
-        },
-      });
-
-      const presentCount = attendanceRecords.filter(
-        (r) => r.status === AttendanceStatus.PRESENT
-      ).length;
+      const presentCount = loggedInUserIds.size;
       const attendancePercent =
         totalEmployees > 0 ? Math.round((presentCount / totalEmployees) * 100) : 0;
 
@@ -1410,7 +1568,7 @@ app.get(
         avgProductivity,
         attendancePercent,
         presentCount,
-        totalRecorded: attendanceRecords.length,
+        totalRecorded: presentCount,
       });
     } catch (error) {
       console.error(error);
@@ -1553,7 +1711,7 @@ app.post(
   requireRoles(UserRole.ADMIN, UserRole.MANAGER),
   asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
-    const { title, description, assignedToId, departmentId, dueDate, priority } = req.body;
+    const { title, description, assignedToId, departmentId, dueDate, priority, estimatedHours } = req.body;
 
     if (!title) {
       res.status(400).json({ message: "Workflow title is required" });
@@ -1564,6 +1722,7 @@ app.post(
       title,
       description: description ?? null,
       dueDate: dueDate ? new Date(dueDate) : null,
+      estimatedHours: estimatedHours ? Number(estimatedHours) : null,
       priority: priority || WorkflowPriority.MEDIUM,
     };
     const workflowAssignedToId = assignedToId ? Number(assignedToId) : null;
@@ -1899,8 +2058,10 @@ app.get(
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
     const date = dayStart(req.query.date ? String(req.query.date) : undefined);
-    const [attendance, productivity, workflowCounts, activeSessions] = await Promise.all([
+    const tomorrow = new Date(date.getTime() + 24 * 60 * 60 * 1000);
+    const [attendance, productivityEmployees, workflowCounts, activeSessions, breakAllowanceMinutes] = await Promise.all([
       prisma.attendanceRecord.findMany({
         where: {
           date,
@@ -1908,12 +2069,26 @@ app.get(
         },
         include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
       }),
-      prisma.productivityRecord.findMany({
-        where: {
-          date,
-          user: { role: UserRole.EMPLOYEE },
+      prisma.user.findMany({
+        where: { role: UserRole.EMPLOYEE },
+        include: {
+          productivityRecords: {
+            where: { date },
+            orderBy: { date: "desc" },
+            take: 1,
+          },
+          loginSessions: {
+            where: {
+              loginAt: {
+                gte: date,
+                lt: tomorrow,
+              },
+            },
+            orderBy: { loginAt: "desc" },
+            take: 1,
+          },
         },
-        include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
+        orderBy: { firstName: "asc" },
       }),
       prisma.workflowTask.groupBy({
         by: ["status"],
@@ -1925,10 +2100,68 @@ app.get(
           user: { role: UserRole.EMPLOYEE },
         },
       }),
+      getBreakAllowanceMinutes(),
     ]);
+
+    const productivity = productivityEmployees.map((employee) => {
+      const record = employee.productivityRecords[0];
+
+      if (record) {
+        return {
+          ...record,
+          user: {
+            employeeCode: employee.employeeCode,
+            firstName: employee.firstName,
+            lastName: employee.lastName,
+          },
+        };
+      }
+
+      const session = employee.loginSessions[0];
+      const endTime = session?.logoutAt || new Date();
+      const loginMinutes = session ? minutesBetween(session.loginAt, endTime) : 0;
+      const idleMinutes = session?.idleMinutes ?? 0;
+      const breakMinutes = session?.breakMinutes ?? 0;
+      const productiveMinutes = productiveMinutesWithBreakAllowance(
+        loginMinutes,
+        idleMinutes,
+        breakMinutes,
+        breakAllowanceMinutes,
+      );
+      const percent = productivityPercent(productiveMinutes, loginMinutes);
+
+      return {
+        id: session?.id ?? employee.id,
+        userId: employee.id,
+        date,
+        loginMinutes,
+        activeMinutes: Math.max(0, loginMinutes - idleMinutes - breakMinutes),
+        idleMinutes,
+        breakMinutes,
+        productiveMinutes,
+        productivityPercent: percent,
+        score: percent,
+        createdAt: session?.createdAt ?? date,
+        updatedAt: session?.updatedAt ?? date,
+        user: {
+          employeeCode: employee.employeeCode,
+          firstName: employee.firstName,
+          lastName: employee.lastName,
+        },
+      };
+    });
 
     res.json({
       date,
+      generatedFor: user
+        ? {
+            employeeCode: user.employeeCode,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            role: user.role,
+          }
+        : null,
       activeSessions,
       attendance,
       productivity,
@@ -1941,31 +2174,174 @@ app.get(
   "/api/reports/export",
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
-  asyncHandler(async (_req, res) => {
-    const records = await prisma.productivityRecord.findMany({
-      where: { user: { role: UserRole.EMPLOYEE } },
-      include: { user: true },
-      orderBy: { date: "desc" },
-      take: 100,
+  asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const date = dayStart(req.query.date ? String(req.query.date) : undefined);
+    const tomorrow = new Date(date.getTime() + 24 * 60 * 60 * 1000);
+    const reportDate = date.toISOString().slice(0, 10);
+    const [attendance, productivityEmployees, workflows, workflowCounts, breakAllowanceMinutes] = await Promise.all([
+      prisma.attendanceRecord.findMany({
+        where: {
+          date,
+          user: { role: UserRole.EMPLOYEE },
+        },
+        include: {
+          user: {
+            select: {
+              employeeCode: true,
+              firstName: true,
+              lastName: true,
+              department: true,
+            },
+          },
+        },
+        orderBy: { user: { firstName: "asc" } },
+      }),
+      prisma.user.findMany({
+        where: { role: UserRole.EMPLOYEE },
+        include: {
+          productivityRecords: {
+            where: { date },
+            orderBy: { date: "desc" },
+            take: 1,
+          },
+          loginSessions: {
+            where: {
+              loginAt: {
+                gte: date,
+                lt: tomorrow,
+              },
+            },
+            orderBy: { loginAt: "desc" },
+            take: 1,
+          },
+        },
+        orderBy: { firstName: "asc" },
+      }),
+      prisma.workflowTask.findMany({
+        include: {
+          assignedTo: {
+            select: { employeeCode: true, firstName: true, lastName: true },
+          },
+          department: true,
+        },
+        orderBy: [{ status: "asc" }, { updatedAt: "desc" }],
+      }),
+      prisma.workflowTask.groupBy({
+        by: ["status"],
+        _count: { status: true },
+      }),
+      getBreakAllowanceMinutes(),
+    ]);
+
+    const productivityRows = productivityEmployees.map((employee) => {
+      const record = employee.productivityRecords[0];
+
+      if (record) {
+        return {
+          employeeCode: employee.employeeCode,
+          name: `${employee.firstName} ${employee.lastName}`,
+          loginMinutes: record.loginMinutes,
+          activeMinutes: record.activeMinutes,
+          idleMinutes: record.idleMinutes,
+          breakMinutes: record.breakMinutes,
+          productiveMinutes: record.productiveMinutes,
+          productivityPercent: record.productivityPercent,
+        };
+      }
+
+      const session = employee.loginSessions[0];
+      const endTime = session?.logoutAt || new Date();
+      const loginMinutes = session ? minutesBetween(session.loginAt, endTime) : 0;
+      const idleMinutes = session?.idleMinutes ?? 0;
+      const breakMinutes = session?.breakMinutes ?? 0;
+      const productiveMinutes = productiveMinutesWithBreakAllowance(
+        loginMinutes,
+        idleMinutes,
+        breakMinutes,
+        breakAllowanceMinutes,
+      );
+
+      return {
+        employeeCode: employee.employeeCode,
+        name: `${employee.firstName} ${employee.lastName}`,
+        loginMinutes,
+        activeMinutes: Math.max(0, loginMinutes - idleMinutes - breakMinutes),
+        idleMinutes,
+        breakMinutes,
+        productiveMinutes,
+        productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
+      };
     });
+
     const csv = [
-      "Employee Code,Name,Date,Login Minutes,Idle Minutes,Break Minutes,Productive Minutes,Productivity Percent",
-      ...records.map((record) =>
-        [
+      csvRow(["Daily Report", reportDate]),
+      csvRow(["Generated For", user ? `${user.firstName} ${user.lastName}` : ""]),
+      csvRow(["Employee Code", user?.employeeCode || ""]),
+      csvRow(["Role", user?.role || ""]),
+      csvRow(["Email", user?.email || ""]),
+      "",
+      csvRow(["Attendance"]),
+      csvRow(["Employee Code", "Name", "Department", "Status", "Login At", "Logout At", "Late Minutes"]),
+      ...attendance.map((record) =>
+        csvRow([
           record.user.employeeCode,
           `${record.user.firstName} ${record.user.lastName}`,
-          record.date.toISOString().slice(0, 10),
+          record.user.department?.name || "Unassigned",
+          record.status,
+          record.loginAt ? record.loginAt.toISOString() : "",
+          record.logoutAt ? record.logoutAt.toISOString() : "",
+          record.lateMinutes,
+        ]),
+      ),
+      "",
+      csvRow(["Productivity"]),
+      csvRow([
+        "Employee Code",
+        "Name",
+        "Login Minutes",
+        "Active Minutes",
+        "Idle Minutes",
+        "Break Minutes",
+        "Productive Minutes",
+        "Productivity Percent",
+      ]),
+      ...productivityRows.map((record) =>
+        csvRow([
+          record.employeeCode,
+          record.name,
           record.loginMinutes,
+          record.activeMinutes,
           record.idleMinutes,
           record.breakMinutes,
           record.productiveMinutes,
           record.productivityPercent,
-        ].join(","),
+        ]),
+      ),
+      "",
+      csvRow(["Workflow Summary"]),
+      csvRow(["Status", "Count"]),
+      ...workflowCounts.map((item) => csvRow([item.status, item._count.status])),
+      "",
+      csvRow(["Workflow Details"]),
+      csvRow(["Title", "Assigned To", "Department", "Status", "Estimated Hours", "Actual Hours", "Due Date"]),
+      ...workflows.map((workflow) =>
+        csvRow([
+          workflow.title,
+          workflow.assignedTo
+            ? `${workflow.assignedTo.firstName} ${workflow.assignedTo.lastName} (${workflow.assignedTo.employeeCode})`
+            : "Unassigned",
+          workflow.department?.name || "Unassigned",
+          workflow.status,
+          workflow.estimatedHours ?? "",
+          workflow.actualHours ?? "",
+          workflow.dueDate ? workflow.dueDate.toISOString().slice(0, 10) : "",
+        ]),
       ),
     ].join("\n");
 
-    res.header("Content-Type", "text/csv");
-    res.attachment("productivity-report.csv");
+    res.header("Content-Type", "text/csv; charset=utf-8");
+    res.attachment(`daily-report-${reportDate}.csv`);
     res.send(csv);
   }),
 );

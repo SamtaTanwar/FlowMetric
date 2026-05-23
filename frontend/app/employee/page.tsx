@@ -14,7 +14,13 @@ import {
 import { useEffect , useState } from "react";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
-import { apiRequest, clearAuth, getStoredToken, getStoredUser, type StoredUser } from "@/lib/api";
+import {
+  apiRequest,
+  clearAuth,
+  getStoredToken,
+  getStoredUser,
+  type StoredUser,
+} from "@/lib/api";
 
 type ActiveSessionResponse = {
   activeSession: {
@@ -24,6 +30,7 @@ type ActiveSessionResponse = {
     idleMinutes?: number;
   } | null;
   isOnBreak: boolean;
+  breakStartedAt?: string | null;
 };
 
 type TrackingSessionResponse = {
@@ -42,8 +49,11 @@ type EmployeeNotification = {
   isRead: boolean;
 };
 
+const BREAK_ALLOWANCE_SECONDS = 45 * 60;
+
 export default function EmployeeDashboard() {
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
+  const [isAuthorized, setIsAuthorized] = useState(false);
   const [isTracking, setIsTracking] = useState(false);
   const [isOnBreak, setIsOnBreak] = useState(false);
   const [isIdle, setIsIdle] = useState(false);
@@ -57,33 +67,54 @@ export default function EmployeeDashboard() {
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [currentTimestamp, setCurrentTimestamp] = useState(() => Date.now());
   const [lastProductivityPercent, setLastProductivityPercent] = useState<number | null>(null);
   const [notifications, setNotifications] = useState<EmployeeNotification[]>([]);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [markingNotificationId, setMarkingNotificationId] = useState<number | null>(null);
   const router = useRouter();
 
-  const productiveSeconds = Math.max(0, elapsedSeconds - breakSeconds - idleSeconds);
+  const liveBreakSeconds =
+    breakSeconds +
+    (isOnBreak && breakStartedAt
+      ? Math.max(0, Math.round((currentTimestamp - breakStartedAt) / 1000))
+      : 0);
+  const breakPenaltySeconds = Math.max(0, liveBreakSeconds - BREAK_ALLOWANCE_SECONDS);
+  const activeSeconds = Math.max(0, elapsedSeconds - idleSeconds - liveBreakSeconds);
+  const productiveSeconds = Math.max(0, elapsedSeconds - idleSeconds - breakPenaltySeconds);
   const productivityPercent = elapsedSeconds
     ? Math.min(100, Math.round((productiveSeconds / elapsedSeconds) * 100))
     : 0;
   const unreadCount = notifications.filter((item) => !item.isRead).length;
 
   useEffect(() => {
-    const token = getStoredToken();
-    const storedUser = getStoredUser();
+    async function verifyEmployee() {
+      const token = getStoredToken();
+      const storedUser = getStoredUser();
 
-    if (!token) {
-      router.replace("/login");
-      return;
+      if (!token) {
+        router.replace("/");
+        return;
+      }
+
+      try {
+        const response = await apiRequest<{ user: StoredUser }>("/api/auth/me");
+        const user = response.user || storedUser;
+
+        if (user?.role !== "EMPLOYEE") {
+          router.replace("/dashboard");
+          return;
+        }
+
+        setCurrentUser(user);
+        setIsAuthorized(true);
+      } catch {
+        clearAuth();
+        router.replace("/");
+      }
     }
 
-    if (storedUser?.role !== "EMPLOYEE") {
-      router.replace("/dashboard");
-      return;
-    }
-
-    setCurrentUser(storedUser);
+    verifyEmployee();
   }, [router]);
 
   useEffect(() => {
@@ -104,14 +135,15 @@ export default function EmployeeDashboard() {
   useEffect(() => {
   let interval: NodeJS.Timeout;
 
-  if (isTracking && !isOnBreak) {
+  if (isTracking) {
     interval = setInterval(() => {
       setElapsedSeconds((prev) => prev + 1);
+      setCurrentTimestamp(Date.now());
     }, 1000);
   }
 
   return () => clearInterval(interval);
-}, [isTracking, isOnBreak]);
+}, [isTracking]);
 
 function formatTime(totalSeconds: number) {
   const hours = Math.floor(totalSeconds / 3600);
@@ -126,6 +158,8 @@ function formatTime(totalSeconds: number) {
 }
 
 useEffect(() => {
+  if (!isAuthorized) return;
+
   async function restoreSession() {
     try {
       const data = await apiRequest<ActiveSessionResponse>("/api/tracking/active-session");
@@ -137,12 +171,14 @@ useEffect(() => {
       setSessionId(data.activeSession.id);
 
       setIsOnBreak(data.isOnBreak);
+      setBreakStartedAt(data.breakStartedAt ? new Date(data.breakStartedAt).getTime() : null);
 
     const loginTime = new Date(
   data.activeSession.loginAt
 ).getTime();
 
       const now = Date.now();
+      setCurrentTimestamp(now);
 
       const diffSeconds = Math.floor(
         (now - loginTime) / 1000
@@ -157,7 +193,7 @@ useEffect(() => {
   }
 
   restoreSession();
-}, []);
+}, [isAuthorized]);
   useEffect(() => {
   if (!isTracking || isOnBreak) return;
 
@@ -272,6 +308,7 @@ useEffect(() => {
     setElapsedSeconds(0);
     setBreakSeconds(0);
     setIdleSeconds(0);
+    setCurrentTimestamp(Date.now());
     setLastProductivityPercent(null);
 
     toast.success("Work session started successfully");
@@ -296,9 +333,9 @@ async function handleClockOut() {
       method: "POST",
       body: JSON.stringify({
         sessionId,
-        activeMinutes: Math.round(productiveSeconds / 60),
+        activeMinutes: Math.round(activeSeconds / 60),
         idleMinutes: Math.round(idleSeconds / 60),
-        breakMinutes: Math.round(breakSeconds / 60),
+        breakMinutes: Math.round(liveBreakSeconds / 60),
       }),
     });
 
@@ -309,6 +346,7 @@ async function handleClockOut() {
     setBreakStartedAt(null);
     setBreakSeconds(0);
     setIdleSeconds(0);
+    setCurrentTimestamp(Date.now());
     setLastProductivityPercent(
       typeof result.productivity?.productivityPercent === "number"
         ? Math.round(result.productivity.productivityPercent)
@@ -387,6 +425,16 @@ async function handleMarkAsRead(id: number) {
   } finally {
     setMarkingNotificationId(null);
   }
+}
+
+if (!isAuthorized) {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-[#020617] px-6 text-center text-white">
+      <div className="rounded-2xl border border-white/10 bg-white/6 p-6 shadow-2xl shadow-black/30 backdrop-blur-xl">
+        <p className="text-sm font-medium text-slate-300">Checking session...</p>
+      </div>
+    </main>
+  );
 }
 
   return (

@@ -117,6 +117,8 @@ type PolicyItem = {
   width: string;
 };
 
+const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
+
 type WorkdayStats = {
   loginTime: string | null;
   activeMinutes: number;
@@ -234,6 +236,13 @@ type ApiAttendanceRecord = {
 
 type ApiDailyReport = {
   date: string;
+  generatedFor?: {
+    employeeCode: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    role: string;
+  } | null;
   activeSessions: number;
   attendance: ApiAttendanceRecord[];
   productivity: Array<{
@@ -318,6 +327,16 @@ function productivityPercent(productiveMinutes: number, loginMinutes: number) {
   return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
 
+function productiveMinutesWithBreakAllowance(
+  loginMinutes: number,
+  idleMinutes: number,
+  breakMinutes: number,
+  breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES,
+) {
+  const excessBreakMinutes = Math.max(0, breakMinutes - breakAllowanceMinutes);
+  return Math.max(0, loginMinutes - idleMinutes - excessBreakMinutes);
+}
+
 function timeAgo(value?: string) {
   if (!value) {
     return "Just now";
@@ -344,7 +363,7 @@ function mapEmployee(employee: ApiEmployee): EmployeeRow {
   const liveLoginMinutes = session ? Math.max(0, Math.round((Date.now() - new Date(session.loginAt).getTime()) / 60000)) : 0;
   const idleMinutes = isActiveSession ? session?.idleMinutes ?? 0 : productivity?.idleMinutes ?? session?.idleMinutes ?? 0;
   const breakMinutes = session?.breakMinutes ?? 0;
-  const liveProductiveMinutes = Math.max(0, liveLoginMinutes - idleMinutes - breakMinutes);
+  const liveProductiveMinutes = productiveMinutesWithBreakAllowance(liveLoginMinutes, idleMinutes, breakMinutes);
   const productivityValue = isActiveSession
     ? productivityPercent(liveProductiveMinutes, liveLoginMinutes)
     : Math.round(productivity?.productivityPercent ?? 0);
@@ -558,6 +577,12 @@ export default function DashboardPage() {
   const [, setLiveEmployees] = useState<ApiLiveEmployee[]>([]);
   const [reportCards, setReportCards] = useState<ReportItem[]>([]);
   const [policyItems, setPolicyItems] = useState<PolicyItem[]>([]);
+  const [systemSettings, setSystemSettings] = useState<Record<string, boolean>>({
+    "Role-based admin access": true,
+    "Daily reports scheduled at 6:00 PM": true,
+    "Audit logging for admin actions": true,
+    "Secure token-based sessions": true,
+  });
   const [attendanceRecords, setAttendanceRecords] = useState<ApiAttendanceRecord[]>([]);
   const [departmentChartData, setDepartmentChartData] = useState<Array<{ name: string; value: number; color: string }>>([]);
   const [productivityChartData, setProductivityChartData] = useState<Array<{ day: string; productivity: number; attendance: number; tasks: number }>>([]);
@@ -627,7 +652,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
     const storedUser = getStoredUser();
 
     if (!token) {
-      router.replace("/login");
+      router.replace("/");
       return;
     }
 
@@ -638,6 +663,13 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
 
     async function loadDashboardData() {
       try {
+        const meResponse = await apiRequest<{ user: StoredUser }>("/api/auth/me");
+
+        if (meResponse.user?.role === "EMPLOYEE") {
+          router.replace("/employee");
+          return;
+        }
+
         const [
           employeesResponse,
           workflowsResponse,
@@ -667,7 +699,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
           apiRequest<ApiDailyReport>("/api/reports/daily"),
         ]);
 
-        setCurrentUser(storedUser);
+        setCurrentUser(meResponse.user || storedUser);
         const mappedEmployees = employeesResponse.employees.map(mapEmployee);
         const mappedWorkflows = workflowsResponse.workflows.map(mapWorkflow);
         const mappedNotifications = adminNotificationsOnly(
@@ -786,12 +818,12 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
 
         if (message.toLowerCase().includes("token") || message.toLowerCase().includes("auth")) {
           clearAuth();
-          router.replace("/login");
+          router.replace("/");
           return;
         }
 
-        setApiStatus("Backend connection failed - start backend on port 5000");
-        setIsAuthorized(true);
+        clearAuth();
+        router.replace("/");
       }
     }
 
@@ -830,7 +862,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
     setIsExporting(true);
 
     try {
-      await downloadApiFile("/api/reports/export", "productivity-report.csv");
+      await downloadApiFile("/api/reports/export", "daily-report.csv");
     } finally {
       setIsExporting(false);
     }
@@ -1162,7 +1194,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
             )}
             {activeTab === "attendance" && <AttendanceView records={attendanceRecords} rows={employeeRows} />}
             {activeTab === "activity" && <ActivityView chartData={activityChartData} rows={employeeRows} />}
-            {activeTab === "workflow" && <WorkflowView items={workflowItems} />}
+            {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
             {activeTab === "notifications" && (
               <NotificationView
                 items={notificationItems}
@@ -1172,9 +1204,17 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
               />
             )}
             {activeTab === "reports" && (
-              <ReportsView exporting={isExporting} items={reportCards} onExport={handleExportReport} />
+              <ReportsView currentUser={currentUser} exporting={isExporting} items={reportCards} onExport={handleExportReport} />
             )}
-            {activeTab === "settings" && <SettingsView policies={policyItems} />}
+            {activeTab === "settings" && (
+              <SettingsView
+                onToggleSetting={(setting) =>
+                  setSystemSettings((items) => ({ ...items, [setting]: !items[setting] }))
+                }
+                policies={policyItems}
+                settings={systemSettings}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -1330,6 +1370,21 @@ function EmployeeSelfDashboard({
 const productivityValue = workdayStats?.productivity ?? employee.productivity ?? 0;
 const summary = [
   {
+    label: "Active Now",
+    value: employee.status === "Active" ? "Active" : "Offline",
+  },
+
+  {
+    label: "Attendance",
+    value: employee.attendance,
+  },
+
+  {
+    label: "Productivity",
+    value: `${productivityValue}%`,
+  },
+
+  {
     label: "Login Time",
     value: workdayStats?.loginTime
       ? new Date(
@@ -1365,7 +1420,7 @@ const summary = [
         <p className="mb-4 text-sm text-slate-400">
           These numbers belong to the employee selected from search or the Employee Directory.
         </p>
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-3">
           {summary.map((item) => (
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4" key={item.label}>
               <p className="text-sm font-medium text-slate-400">{item.label}</p>
@@ -1537,11 +1592,27 @@ function ActivityView({
   );
 }
 
-function WorkflowView({ items = [] }: { items?: WorkflowItem[] }) {
+function WorkflowView({
+  currentUser,
+  items = [],
+}: {
+  currentUser?: StoredUser | null;
+  items?: WorkflowItem[];
+}) {
   return (
     <SectionCard title="Workflow Tracking">
+      {currentUser && (
+        <div className="mb-5 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-50">
+          <p className="font-semibold">
+            Logged in: {currentUser.firstName} {currentUser.lastName}
+          </p>
+          <p className="mt-1 text-cyan-100/80">
+            {currentUser.employeeCode} • {currentUser.role} • {items.length} workflow{items.length === 1 ? "" : "s"}
+          </p>
+        </div>
+      )}
       <div className="grid gap-4 lg:grid-cols-2">
-        {items.map((workflow) => (
+        {items.length ? items.map((workflow) => (
           <div className="rounded-2xl border border-white/10 bg-white/4 p-5" key={workflow.title}>
             <div className="flex items-start justify-between gap-4">
               <div>
@@ -1577,7 +1648,11 @@ function WorkflowView({ items = [] }: { items?: WorkflowItem[] }) {
               <span className="font-semibold text-slate-200">{workflow.due}</span>
             </div>
           </div>
-        ))}
+        )) : (
+          <div className="rounded-2xl border border-white/10 bg-white/4 p-5 text-sm text-slate-400 lg:col-span-2">
+            No workflows created or assigned yet for the current view.
+          </div>
+        )}
       </div>
     </SectionCard>
   );
@@ -1696,10 +1771,12 @@ function KeyboardMetric({
 }
 
 function ReportsView({
+  currentUser,
   exporting,
   items = [],
   onExport,
 }: {
+  currentUser?: StoredUser | null;
   exporting: boolean;
   items?: ReportItem[];
   onExport: () => void;
@@ -1719,6 +1796,16 @@ function ReportsView({
       }
       title="Reports"
     >
+      {currentUser && (
+        <div className="mb-5 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-50">
+          <p className="font-semibold">
+            Report for: {currentUser.firstName} {currentUser.lastName}
+          </p>
+          <p className="mt-1 text-cyan-100/80">
+            {currentUser.employeeCode} • {currentUser.role} • {currentUser.email}
+          </p>
+        </div>
+      )}
       <div className="grid gap-4 md:grid-cols-3">
         {items.map((report) => (
           <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={report.title}>
@@ -1737,26 +1824,42 @@ function ReportsView({
   );
 }
 
-function SettingsView({ policies = [] }: { policies?: PolicyItem[] }) {
-  const settings = [
-    "Role-based admin access",
-    "Daily reports scheduled at 6:00 PM",
-    "Audit logging for admin actions",
-    "Secure token-based sessions",
-  ];
+function SettingsView({
+  onToggleSetting,
+  policies = [],
+  settings,
+}: {
+  onToggleSetting: (setting: string) => void;
+  policies?: PolicyItem[];
+  settings: Record<string, boolean>;
+}) {
+  const settingItems = Object.keys(settings);
 
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,0.9fr)_minmax(320px,1.1fr)]">
       <SectionCard title="System Settings">
         <div className="grid gap-4">
-          {settings.map((setting) => (
+          {settingItems.map((setting) => {
+            const enabled = settings[setting];
+
+            return (
             <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/4 p-4" key={setting}>
               <span className="font-medium text-slate-200">{setting}</span>
-              <span className="rounded-full bg-emerald-300/10 px-2.5 py-1 text-xs font-semibold text-emerald-200 ring-1 ring-emerald-300/20">
-                Enabled
-              </span>
+              <button
+                aria-pressed={enabled}
+                className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 transition ${
+                  enabled
+                    ? "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20 hover:bg-emerald-300/15"
+                    : "bg-slate-300/10 text-slate-300 ring-white/10 hover:bg-white/10"
+                }`}
+                onClick={() => onToggleSetting(setting)}
+                type="button"
+              >
+                {enabled ? "Enabled" : "Disabled"}
+              </button>
             </div>
-          ))}
+            );
+          })}
         </div>
       </SectionCard>
 
