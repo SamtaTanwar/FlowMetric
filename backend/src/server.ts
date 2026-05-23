@@ -7,6 +7,9 @@ import { createServer } from "node:http";
 import { Server } from "socket.io";
 import {
   AttendanceStatus,
+  LeaveRequestStatus,
+  LeaveType,
+  NotificationPriority,
   NotificationType,
   Prisma,
   PrismaClient,
@@ -35,6 +38,7 @@ type AuthUser = {
   firstName: string;
   lastName: string;
   role: UserRole;
+  accountType: "ADMIN" | "USER";
 };
 
 type AuthRequest = Request & {
@@ -58,19 +62,44 @@ function getAuthUser(req: Request) {
   return (req as AuthRequest).user;
 }
 
+function userActorId(user?: AuthUser) {
+  return user?.accountType === "USER" ? user.id : null;
+}
+
+function adminActorId(user?: AuthUser) {
+  return user?.accountType === "ADMIN" ? user.id : null;
+}
+
+function isEmployeeAccount(
+  user?: AuthUser,
+): user is AuthUser & { accountType: "USER"; role: "EMPLOYEE" } {
+  return user?.accountType === "USER" && user.role === UserRole.EMPLOYEE;
+}
+
 function generateToken(user: AuthUser) {
   return jwt.sign(
     {
       userId: user.id,
       role: user.role,
       employeeCode: user.employeeCode,
+      accountType: user.accountType,
     },
     jwtSecret,
     { expiresIn: "8h" },
   );
 }
 
-function sanitizeUser(user: AuthUser & { department?: unknown; shift?: unknown }) {
+function sanitizeUser(user: {
+  id: number;
+  employeeCode: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  role: UserRole;
+  accountType?: "ADMIN" | "USER";
+  department?: unknown;
+  shift?: unknown;
+}) {
   return {
     id: user.id,
     employeeCode: user.employeeCode,
@@ -78,6 +107,7 @@ function sanitizeUser(user: AuthUser & { department?: unknown; shift?: unknown }
     lastName: user.lastName,
     email: user.email,
     role: user.role,
+    accountType: user.accountType,
     department: user.department,
     shift: user.shift,
   };
@@ -92,11 +122,27 @@ function minutesBetween(start: Date, end: Date) {
   return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
 
-function shiftStartForDate(date: Date, shiftStart = "09:00") {
-  const [hours = "9", minutes = "0"] = shiftStart.split(":");
+function timeForDate(date: Date, hours: number, minutes: number) {
   const result = dayStart(date);
-  result.setHours(Number(hours), Number(minutes), 0, 0);
+  result.setHours(hours, minutes, 0, 0);
   return result;
+}
+
+function attendanceForLogin(loginAt: Date) {
+  const shiftStart = timeForDate(loginAt, 9, 0);
+  const halfDayThreshold = timeForDate(loginAt, 9, 15);
+
+  if (loginAt.getTime() >= halfDayThreshold.getTime()) {
+    return {
+      status: AttendanceStatus.HALF_DAY,
+      lateMinutes: minutesBetween(shiftStart, loginAt),
+    };
+  }
+
+  return {
+    status: AttendanceStatus.PRESENT,
+    lateMinutes: 0,
+  };
 }
 
 function productivityPercent(productiveMinutes: number, loginMinutes: number) {
@@ -107,15 +153,107 @@ function productivityPercent(productiveMinutes: number, loginMinutes: number) {
   return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
 
-async function writeAuditLog(actorId: number | null, action: string, entity: string, entityId?: string) {
+function monthRange(date = new Date()) {
+  const start = new Date(date.getFullYear(), date.getMonth(), 1);
+  const end = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+
+  return { start, end };
+}
+
+async function calculateLeavePaySplit(userId: number, type: LeaveType, days: number) {
+  if (type !== LeaveType.SICK) {
+    return { paidDays: 0, unpaidDays: days };
+  }
+
+  const { start, end } = monthRange();
+  const usedPaidSickLeave = await prisma.leaveRequest.aggregate({
+    where: {
+      userId,
+      type: LeaveType.SICK,
+      status: LeaveRequestStatus.APPROVED,
+      createdAt: {
+        gte: start,
+        lt: end,
+      },
+    },
+    _sum: {
+      paidDays: true,
+    },
+  });
+  const remainingPaidSickLeave = Math.max(0, 1 - (usedPaidSickLeave._sum.paidDays ?? 0));
+  const paidDays = Math.min(days, remainingPaidSickLeave);
+
+  return {
+    paidDays,
+    unpaidDays: days - paidDays,
+  };
+}
+
+function validatePasswordStrength(password: string) {
+  if (
+    password.length < 8 ||
+    !/[A-Za-z]/.test(password) ||
+    !/\d/.test(password) ||
+    !/[^A-Za-z0-9]/.test(password)
+  ) {
+    return "Password must be at least 8 characters and include a letter, number, and symbol";
+  }
+
+  return null;
+}
+
+function prismaErrorMessage(error: unknown) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === "P2002") {
+      return "A record with this value already exists";
+    }
+
+    if (error.code === "P2003") {
+      return "This action cannot be completed because related data is missing";
+    }
+
+    if (error.code === "P2025") {
+      return "The requested record was not found";
+    }
+
+    if (error.code === "P2021" || error.code === "P2022") {
+      return "Database schema is not synced. Run npx.cmd prisma db push from the backend folder";
+    }
+
+    return "Database request failed";
+  }
+
+  if (error instanceof Prisma.PrismaClientValidationError) {
+    return "Invalid data sent to the database";
+  }
+
+  if (error instanceof Prisma.PrismaClientInitializationError) {
+    return "Database connection could not be initialized";
+  }
+
+  return null;
+}
+
+async function writeAuditLog(
+  actorId: number | null,
+  action: string,
+  entity: string,
+  entityId?: string,
+  actorAdminId: number | null = null,
+) {
   await prisma.auditLog.create({
     data: {
       actorId,
+      actorAdminId,
       action,
       entity,
       entityId: entityId ?? null,
     },
   });
+}
+
+async function writeAuthAuditLog(user: AuthUser | undefined, action: string, entity: string, entityId?: string) {
+  await writeAuditLog(userActorId(user), action, entity, entityId, adminActorId(user));
 }
 
 const authenticate: RequestHandler = asyncHandler(async (req, res, next) => {
@@ -128,7 +266,43 @@ const authenticate: RequestHandler = asyncHandler(async (req, res, next) => {
 
   try {
     const token = authHeader.replace("Bearer ", "");
-    const payload = jwt.verify(token, jwtSecret) as { userId: number };
+    const payload = jwt.verify(token, jwtSecret) as {
+      userId: number;
+      accountType?: "ADMIN" | "USER";
+    };
+
+    if (payload.accountType === "ADMIN") {
+      const admin = await prisma.admin.findUnique({
+        where: { id: payload.userId },
+        select: {
+          id: true,
+          adminCode: true,
+          firstName: true,
+          lastName: true,
+          email: true,
+          role: true,
+          status: true,
+        },
+      });
+
+      if (!admin || admin.status !== "ACTIVE") {
+        res.status(401).json({ message: "User is inactive or no longer exists" });
+        return;
+      }
+
+      (req as AuthRequest).user = {
+        id: admin.id,
+        employeeCode: admin.adminCode,
+        firstName: admin.firstName,
+        lastName: admin.lastName,
+        email: admin.email,
+        role: admin.role,
+        accountType: "ADMIN",
+      };
+      next();
+      return;
+    }
+
     const user = await prisma.user.findUnique({
       where: { id: payload.userId },
       select: {
@@ -147,7 +321,10 @@ const authenticate: RequestHandler = asyncHandler(async (req, res, next) => {
       return;
     }
 
-    (req as AuthRequest).user = user;
+    (req as AuthRequest).user = {
+      ...user,
+      accountType: "USER",
+    };
     next();
   } catch {
     res.status(401).json({ message: "Invalid or expired authentication token" });
@@ -290,6 +467,47 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
     return;
   }
 
+  const admin = await prisma.admin.findFirst({
+    where: {
+      OR: [
+        employeeCode ? { adminCode: employeeCode } : undefined,
+        email ? { email } : undefined,
+      ].filter(Boolean) as Array<{ adminCode?: string; email?: string }>,
+    },
+  });
+
+  if (admin && (await bcrypt.compare(password, admin.passwordHash))) {
+    if (admin.status !== "ACTIVE") {
+      res.status(403).json({ message: "This admin account is inactive" });
+      return;
+    }
+
+    const authUser: AuthUser = {
+      id: admin.id,
+      employeeCode: admin.adminCode,
+      firstName: admin.firstName,
+      lastName: admin.lastName,
+      email: admin.email,
+      role: admin.role,
+      accountType: "ADMIN",
+    };
+    const token = generateToken(authUser);
+
+    await prisma.admin.update({
+      where: { id: admin.id },
+      data: { lastLoginAt: new Date() },
+    });
+    await writeAuthAuditLog(authUser, "LOGIN", "Admin", String(admin.id));
+
+    res.json({
+      message: "Login successful",
+      token,
+      user: sanitizeUser(authUser),
+      deviceInfo,
+    });
+    return;
+  }
+
   const user = await prisma.user.findFirst({
     where: {
       OR: [
@@ -317,6 +535,7 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
     lastName: user.lastName,
     email: user.email,
     role: user.role,
+    accountType: "USER",
   };
   const token = generateToken(authUser);
 
@@ -324,12 +543,12 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
     where: { id: user.id },
     data: { lastLoginAt: new Date() },
   });
-  await writeAuditLog(user.id, "LOGIN", "User", String(user.id));
+  await writeAuthAuditLog(authUser, "LOGIN", "User", String(user.id));
 
   res.json({
     message: "Login successful",
     token,
-    user: sanitizeUser(user),
+    user: sanitizeUser({ ...user, accountType: "USER" }),
     deviceInfo,
   });
 }));
@@ -359,6 +578,13 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
     return;
   }
 
+  const passwordError = validatePasswordStrength(password);
+
+  if (passwordError) {
+    res.status(400).json({ message: passwordError });
+    return;
+  }
+
   // Validate official email
   if (!email.endsWith("@bridgegroupsolutions.com")) {
     res.status(400).json({
@@ -368,11 +594,12 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
   }
 
   // Check existing user
-  const existingUser = await prisma.user.findUnique({
-    where: { email },
-  });
+  const [existingUser, existingAdmin] = await Promise.all([
+    prisma.user.findUnique({ where: { email } }),
+    prisma.admin.findUnique({ where: { email } }),
+  ]);
 
-  if (existingUser) {
+  if (existingUser || existingAdmin) {
     res.status(400).json({
       message: "Account already exists",
     });
@@ -430,6 +657,13 @@ app.post("/api/auth/create-password", asyncHandler(async (req, res) => {
 
   if (!employeeCode || !email || !password) {
     res.status(400).json({ message: "Employee code, email, and new password are required" });
+    return;
+  }
+
+  const passwordError = validatePasswordStrength(password);
+
+  if (passwordError) {
+    res.status(400).json({ message: passwordError });
     return;
   }
 
@@ -492,6 +726,12 @@ app.post("/api/auth/logout", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
+  if (user.accountType === "ADMIN") {
+    await writeAuthAuditLog(user, "LOGOUT", "Admin", String(user.id));
+    res.json({ message: "Logout successful" });
+    return;
+  }
+
   const activeSession = await prisma.loginSession.findFirst({
     where: {
       userId: user.id,
@@ -507,7 +747,7 @@ app.post("/api/auth/logout", authenticate, asyncHandler(async (req, res) => {
   }
 
   const result = await finalizeSession(activeSession.id, req.body);
-  await writeAuditLog(user.id, "LOGOUT", "LoginSession", String(activeSession.id));
+  await writeAuthAuditLog(user, "LOGOUT", "LoginSession", String(activeSession.id));
 
   res.json({
     message: "Logout successful",
@@ -520,6 +760,15 @@ app.get("/api/auth/me", authenticate, asyncHandler(async (req, res) => {
 
   if (!user) {
     res.status(401).json({ message: "Authentication required" });
+    return;
+  }
+
+  if (user.accountType === "ADMIN") {
+    const admin = await prisma.admin.findUnique({
+      where: { id: user.id },
+    });
+
+    res.json({ user: admin ? sanitizeUser({ ...user, employeeCode: admin.adminCode }) : user });
     return;
   }
 
@@ -536,6 +785,9 @@ app.get(
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
+    const today = dayStart();
+    const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+
     const employees = await prisma.user.findMany({
       where: {
   role: UserRole.EMPLOYEE,
@@ -544,14 +796,26 @@ app.get(
         department: true,
         shift: true,
         loginSessions: {
+          where: {
+            loginAt: {
+              gte: today,
+              lt: tomorrow,
+            },
+          },
           orderBy: { loginAt: "desc" },
           take: 1,
         },
         productivityRecords: {
+          where: {
+            date: today,
+          },
           orderBy: { date: "desc" },
           take: 1,
         },
         attendanceRecords: {
+          where: {
+            date: today,
+          },
           orderBy: { date: "desc" },
           take: 1,
         },
@@ -614,6 +878,11 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
+  if (!isEmployeeAccount(user)) {
+    res.status(403).json({ message: "Only employee accounts can start tracking" });
+    return;
+  }
+
   const existing = await prisma.loginSession.findFirst({
     where: { userId: user.id, status: SessionStatus.ACTIVE },
   });
@@ -623,22 +892,15 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
-  const fullUser = await prisma.user.findUnique({
-    where: { id: user.id },
-    include: { shift: true },
-  });
   const loginAt = new Date();
   const date = dayStart(loginAt);
-  const shiftStart = shiftStartForDate(loginAt, fullUser?.shift?.startTime || "09:00");
-  const graceMinutes = fullUser?.shift?.graceMinutes || 10;
-  const lateMinutes = Math.max(0, minutesBetween(shiftStart, loginAt) - graceMinutes);
-  const attendanceStatus = lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.PRESENT;
+  const { lateMinutes, status: attendanceStatus } = attendanceForLogin(loginAt);
 
   const session = await prisma.loginSession.create({
     data: {
       userId: user.id,
       loginAt,
-      deviceInfo: req.body.deviceInfo ?? null,
+      deviceInfo: req.body?.deviceInfo ?? null,
       ipAddress: req.ip ?? null,
       events: {
         create: {
@@ -670,7 +932,7 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
     },
   });
 
-  await writeAuditLog(user.id, "START_TRACKING", "LoginSession", String(session.id));
+  await writeAuthAuditLog(user, "START_TRACKING", "LoginSession", String(session.id));
   io.emit("session-started", { session, user });
 
   res.status(201).json({
@@ -684,16 +946,29 @@ app.get(
   "/api/employees/:id/workday-stats",
   authenticate,
   asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
     const id = Number(req.params.id);
 
+    if (!user) {
+      res.status(401).json({ message: "Authentication required" });
+      return;
+    }
+
+    if (user.id !== id && !adminLikeRoles.includes(user.role)) {
+      res.status(403).json({ message: "You can view only your own workday stats" });
+      return;
+    }
+
     const today = dayStart();
+    const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
 
     const session = await prisma.loginSession.findFirst({
       where: {
         userId: id,
-        // loginAt: {
-        //   gte: today,
-        // },
+        loginAt: {
+          gte: today,
+          lt: tomorrow,
+        },
       },
 
       orderBy: {
@@ -708,10 +983,20 @@ app.get(
         idleMinutes: 0,
         productiveMinutes: 0,
         productivity: 0,
+        isFinalized: false,
       });
 
       return;
     }
+
+    const productivityRecord = await prisma.productivityRecord.findUnique({
+      where: {
+        userId_date: {
+          userId: id,
+          date: today,
+        },
+      },
+    });
 
     const events = await prisma.trackingEvent.findMany({
       where: {
@@ -755,7 +1040,7 @@ app.get(
     );
 
     const productiveMinutes =
-      totalMinutes - idleMinutes;
+      Math.max(0, totalMinutes - idleMinutes - session.breakMinutes);
 
     const productivity =
       totalMinutes > 0
@@ -768,10 +1053,11 @@ app.get(
 
     res.json({
       loginTime: session.loginAt,
-      activeMinutes: totalMinutes,
-      idleMinutes,
-      productiveMinutes,
-      productivity,
+      activeMinutes: productivityRecord?.activeMinutes ?? totalMinutes,
+      idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
+      productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
+      productivity: productivityRecord?.productivityPercent ?? productivity,
+      isFinalized: session.status === SessionStatus.COMPLETED,
     });
   })
 );
@@ -782,6 +1068,11 @@ app.post("/api/tracking/event", authenticate, asyncHandler(async (req, res) => {
 
   if (!user) {
     res.status(401).json({ message: "Authentication required" });
+    return;
+  }
+
+  if (!isEmployeeAccount(user)) {
+    res.status(403).json({ message: "Only employee accounts can record tracking events" });
     return;
   }
 
@@ -834,6 +1125,11 @@ app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
+  if (!isEmployeeAccount(user)) {
+    res.status(403).json({ message: "Only employee accounts can stop tracking" });
+    return;
+  }
+
   const session = await prisma.loginSession.findFirst({
     where: {
       id: sessionId,
@@ -848,7 +1144,7 @@ app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
   }
 
   const result = await finalizeSession(session.id, req.body);
-  await writeAuditLog(user.id, "STOP_TRACKING", "LoginSession", String(session.id));
+  await writeAuthAuditLog(user, "STOP_TRACKING", "LoginSession", String(session.id));
 
   res.json({
     message: "Tracking stopped",
@@ -859,11 +1155,17 @@ app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
 app.get(
   "/api/tracking/active-session",
   authenticate,
-  async (req: any, res) => {
+  async (req, res) => {
     try {
+      const user = getAuthUser(req);
+
+      if (!isEmployeeAccount(user)) {
+        return res.status(403).json({ message: "Only employee accounts can view active sessions" });
+      }
+
       const activeSession = await prisma.loginSession.findFirst({
         where: {
-          userId: req.user.id,
+          userId: user.id,
           logoutAt: null,
         },
 
@@ -911,12 +1213,18 @@ app.get(
 app.get(
   "/api/tracking/latest-session",
   authenticate,
-  async (req: any, res) => {
+  async (req, res) => {
     try {
+      const user = getAuthUser(req);
+
+      if (!isEmployeeAccount(user)) {
+        return res.status(403).json({ message: "Only employee accounts can view latest sessions" });
+      }
+
       const latestSession =
         await prisma.loginSession.findFirst({
           where: {
-            userId: req.user.id,
+            userId: user.id,
           },
 
           orderBy: {
@@ -941,7 +1249,28 @@ app.get(
   authenticate,
   async (req, res) => {
     try {
+      const user = getAuthUser(req);
       const sessionId = Number(req.params.sessionId);
+
+      if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+      }
+
+      const session = await prisma.loginSession.findUnique({
+        where: { id: sessionId },
+        select: { userId: true },
+      });
+
+      if (!session) {
+        res.status(404).json({ message: "Tracking session not found" });
+        return;
+      }
+
+      if (session.userId !== user.id && !adminLikeRoles.includes(user.role)) {
+        res.status(403).json({ message: "You can view only your own tracking events" });
+        return;
+      }
 
       const events = await prisma.trackingEvent.findMany({
         where: {
@@ -1207,6 +1536,9 @@ app.get("/api/workflows", authenticate, asyncHandler(async (req, res) => {
       createdBy: {
         select: { id: true, firstName: true, lastName: true },
       },
+      createdByAdmin: {
+        select: { id: true, firstName: true, lastName: true, adminCode: true },
+      },
       department: true,
     },
     orderBy: { updatedAt: "desc" },
@@ -1228,21 +1560,38 @@ app.post(
       return;
     }
 
-    const workflowData: Prisma.WorkflowTaskUncheckedCreateInput = {
+    const workflowData: Prisma.WorkflowTaskCreateInput = {
       title,
       description: description ?? null,
-      assignedToId: assignedToId ? Number(assignedToId) : null,
-      departmentId: departmentId ? Number(departmentId) : null,
-      createdById: user?.id ?? null,
       dueDate: dueDate ? new Date(dueDate) : null,
       priority: priority || WorkflowPriority.MEDIUM,
     };
+    const workflowAssignedToId = assignedToId ? Number(assignedToId) : null;
+    const workflowDepartmentId = departmentId ? Number(departmentId) : null;
+    const workflowCreatedById = userActorId(user);
+    const workflowCreatedByAdminId = adminActorId(user);
+
+    if (workflowAssignedToId) {
+      workflowData.assignedTo = { connect: { id: workflowAssignedToId } };
+    }
+
+    if (workflowDepartmentId) {
+      workflowData.department = { connect: { id: workflowDepartmentId } };
+    }
+
+    if (workflowCreatedById) {
+      workflowData.createdBy = { connect: { id: workflowCreatedById } };
+    }
+
+    if (workflowCreatedByAdminId) {
+      workflowData.createdByAdmin = { connect: { id: workflowCreatedByAdminId } };
+    }
 
     const workflow = await prisma.workflowTask.create({
       data: workflowData,
     });
 
-    await writeAuditLog(user?.id || null, "CREATE_WORKFLOW", "WorkflowTask", String(workflow.id));
+    await writeAuthAuditLog(user, "CREATE_WORKFLOW", "WorkflowTask", String(workflow.id));
     io.emit("workflow-created", workflow);
 
     res.status(201).json({ message: "Workflow created", workflow });
@@ -1294,7 +1643,7 @@ app.patch("/api/workflows/:id/status", authenticate, asyncHandler(async (req, re
     data: updateData,
   });
 
-  await writeAuditLog(user.id, "UPDATE_WORKFLOW_STATUS", "WorkflowTask", String(id));
+  await writeAuthAuditLog(user, "UPDATE_WORKFLOW_STATUS", "WorkflowTask", String(id));
   io.emit("workflow-updated", updated);
 
   res.json({ message: "Workflow updated", workflow: updated });
@@ -1308,9 +1657,9 @@ app.get("/api/notifications", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
-  const canViewAll = adminLikeRoles.includes(user.role);
+  const canViewAdminNotifications = user.accountType === "ADMIN" || adminLikeRoles.includes(user.role);
   const notifications = await prisma.notification.findMany({
-    where: canViewAll ? {} : { OR: [{ userId: user.id }, { userId: null }] },
+    where: canViewAdminNotifications ? { userId: null } : { userId: user.id },
     orderBy: { createdAt: "desc" },
     take: 50,
   });
@@ -1327,10 +1676,11 @@ app.patch("/api/notifications/:id/read", authenticate, asyncHandler(async (req, 
     return;
   }
 
+  const canReadAdminNotification = user.accountType === "ADMIN" || adminLikeRoles.includes(user.role);
   const notification = await prisma.notification.findFirst({
     where: {
       id,
-      OR: [{ userId: user.id }, { userId: null }],
+      userId: canReadAdminNotification ? null : user.id,
     },
   });
 
@@ -1346,6 +1696,164 @@ app.patch("/api/notifications/:id/read", authenticate, asyncHandler(async (req, 
 
   res.json({ message: "Notification marked as read", notification: updated });
 }));
+
+app.get("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
+  const user = getAuthUser(req);
+
+  if (!user) {
+    res.status(401).json({ message: "Authentication required" });
+    return;
+  }
+
+  const canViewAll = adminLikeRoles.includes(user.role);
+  const requests = await prisma.leaveRequest.findMany({
+    where: canViewAll ? {} : { userId: user.id },
+    include: {
+      user: {
+        select: {
+          id: true,
+          employeeCode: true,
+          firstName: true,
+          lastName: true,
+          department: true,
+        },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+
+  res.json({ requests });
+}));
+
+app.post("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
+  const user = getAuthUser(req);
+  const { reason, days, type = LeaveType.SICK } = req.body;
+
+  if (!user) {
+    res.status(401).json({ message: "Authentication required" });
+    return;
+  }
+
+  if (user.role !== UserRole.EMPLOYEE) {
+    res.status(403).json({ message: "Only employees can send leave requests" });
+    return;
+  }
+
+  const leaveDays = Number(days);
+  const leaveType = String(type).toUpperCase() === LeaveType.CASUAL ? LeaveType.CASUAL : LeaveType.SICK;
+
+  if (!reason || !Number.isInteger(leaveDays) || leaveDays <= 0) {
+    res.status(400).json({ message: "Reason and valid leave days are required" });
+    return;
+  }
+
+  const { paidDays, unpaidDays } = await calculateLeavePaySplit(user.id, leaveType, leaveDays);
+
+  const request = await prisma.leaveRequest.create({
+    data: {
+      userId: user.id,
+      type: leaveType,
+      reason,
+      days: leaveDays,
+      paidDays,
+      unpaidDays,
+    },
+    include: {
+      user: {
+        select: {
+          id: true,
+          employeeCode: true,
+          firstName: true,
+          lastName: true,
+          department: true,
+        },
+      },
+    },
+  });
+
+  await prisma.notification.create({
+    data: {
+      userId: null,
+      type: NotificationType.ADMIN_ANNOUNCEMENT,
+      priority: NotificationPriority.HIGH,
+      title: "Leave request pending",
+      message: `${user.firstName} ${user.lastName} requested ${leaveDays} ${leaveType.toLowerCase()} leave day${leaveDays === 1 ? "" : "s"} (${paidDays} paid, ${unpaidDays} unpaid): ${reason}`,
+    },
+  });
+
+  res.status(201).json({ message: "Leave request sent", request });
+}));
+
+app.patch(
+  "/api/leave-requests/:id",
+  authenticate,
+  requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
+  asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const id = Number(req.params.id);
+    const { status } = req.body;
+
+    if (!user) {
+      res.status(401).json({ message: "Authentication required" });
+      return;
+    }
+
+    if (![LeaveRequestStatus.APPROVED, LeaveRequestStatus.REJECTED].includes(status)) {
+      res.status(400).json({ message: "Status must be APPROVED or REJECTED" });
+      return;
+    }
+
+    const existing = await prisma.leaveRequest.findUnique({
+      where: { id },
+    });
+
+    if (!existing) {
+      res.status(404).json({ message: "Leave request not found" });
+      return;
+    }
+
+    if (existing.status !== LeaveRequestStatus.PENDING) {
+      res.status(400).json({ message: "Leave request is already reviewed" });
+      return;
+    }
+
+    const paySplit = await calculateLeavePaySplit(existing.userId, existing.type, existing.days);
+    const updated = await prisma.leaveRequest.update({
+      where: { id },
+      data: {
+        status,
+        paidDays: status === LeaveRequestStatus.APPROVED ? paySplit.paidDays : 0,
+        unpaidDays: status === LeaveRequestStatus.APPROVED ? paySplit.unpaidDays : existing.days,
+        reviewedById: user.id,
+        reviewedAt: new Date(),
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            employeeCode: true,
+            firstName: true,
+            lastName: true,
+            department: true,
+          },
+        },
+      },
+    });
+
+    await prisma.notification.create({
+      data: {
+        userId: existing.userId,
+        type: NotificationType.ATTENDANCE_WARNING,
+        priority: status === LeaveRequestStatus.APPROVED ? NotificationPriority.MEDIUM : NotificationPriority.HIGH,
+        title: `Leave request ${String(status).toLowerCase()}`,
+        message: `Your ${existing.days} ${existing.type.toLowerCase()} leave day${existing.days === 1 ? "" : "s"} request was ${String(status).toLowerCase()} by ${user.firstName} ${user.lastName}. ${status === LeaveRequestStatus.APPROVED ? `${paySplit.paidDays} paid, ${paySplit.unpaidDays} unpaid.` : ""}`,
+      },
+    });
+
+    res.json({ message: `Leave request ${String(status).toLowerCase()}`, request: updated });
+  }),
+);
 
 app.get("/api/policies", authenticate, asyncHandler(async (_req, res) => {
   const policies = await prisma.workPolicy.findMany({
@@ -1381,7 +1889,7 @@ app.put(
       },
     });
 
-    await writeAuditLog(user?.id || null, "UPDATE_POLICY", "WorkPolicy", String(id));
+    await writeAuthAuditLog(user, "UPDATE_POLICY", "WorkPolicy", String(id));
     res.json({ message: "Policy updated", policy: updated });
   }),
 );
@@ -1464,9 +1972,17 @@ app.get(
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err);
+  const databaseMessage = prismaErrorMessage(err);
+
+  if (databaseMessage) {
+    res.status(400).json({
+      message: databaseMessage,
+    });
+    return;
+  }
+
   res.status(500).json({
     message: "Something went wrong on the server",
-    detail: process.env.NODE_ENV === "production" ? undefined : err.message,
   });
 });
 

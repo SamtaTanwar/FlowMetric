@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { Eye, EyeOff } from "lucide-react";
 import React, { InputHTMLAttributes, useState } from "react";
 
 type Props = InputHTMLAttributes<HTMLInputElement> & {
@@ -47,30 +48,17 @@ export default function AnimatedInput({
             setFocused(false);
             props.onBlur?.(e as any);
           }}
-          type={isPassword && show ? "text" : props.type}
+          type={isPassword ? (show ? "text" : "password") : props.type}
         />
 
         {isPassword && (
           <button
             type="button"
             onClick={() => setShow((s) => !s)}
-            className="text-slate-400"
+            className="text-slate-400 transition hover:text-cyan-200"
+            aria-label={show ? "Hide password" : "Show password"}
           >
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <motion.path
-                d={show ? "M3 3l18 18" : "M1 12c0 0 4-7 11-7s11 7 11 7-4 7-11 7S1 12 1 12z"}
-                stroke="currentColor"
-                strokeWidth={1.5}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
+            {show ? <Eye size={18} /> : <EyeOff size={18} />}
           </button>
         )}
       </div>

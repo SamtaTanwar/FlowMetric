@@ -6,13 +6,44 @@ import {
   LogOut,
   Sparkles,
   BarChart3,
+  CalendarDays,
+  Bell,
+  X,
 } from "lucide-react";
 
 import { useEffect , useState } from "react";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
+import { apiRequest, clearAuth, getStoredToken, getStoredUser, type StoredUser } from "@/lib/api";
+
+type ActiveSessionResponse = {
+  activeSession: {
+    id: number;
+    loginAt: string;
+    breakMinutes?: number;
+    idleMinutes?: number;
+  } | null;
+  isOnBreak: boolean;
+};
+
+type TrackingSessionResponse = {
+  message: string;
+  session: {
+    id: number;
+    loginAt: string;
+  };
+};
+
+type EmployeeNotification = {
+  id: number;
+  title: string;
+  message: string;
+  createdAt: string;
+  isRead: boolean;
+};
 
 export default function EmployeeDashboard() {
+  const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
   const [isTracking, setIsTracking] = useState(false);
   const [isOnBreak, setIsOnBreak] = useState(false);
   const [isIdle, setIsIdle] = useState(false);
@@ -26,12 +57,49 @@ export default function EmployeeDashboard() {
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [lastProductivityPercent, setLastProductivityPercent] = useState<number | null>(null);
+  const [notifications, setNotifications] = useState<EmployeeNotification[]>([]);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [markingNotificationId, setMarkingNotificationId] = useState<number | null>(null);
   const router = useRouter();
 
   const productiveSeconds = Math.max(0, elapsedSeconds - breakSeconds - idleSeconds);
   const productivityPercent = elapsedSeconds
     ? Math.min(100, Math.round((productiveSeconds / elapsedSeconds) * 100))
     : 0;
+  const unreadCount = notifications.filter((item) => !item.isRead).length;
+
+  useEffect(() => {
+    const token = getStoredToken();
+    const storedUser = getStoredUser();
+
+    if (!token) {
+      router.replace("/login");
+      return;
+    }
+
+    if (storedUser?.role !== "EMPLOYEE") {
+      router.replace("/dashboard");
+      return;
+    }
+
+    setCurrentUser(storedUser);
+  }, [router]);
+
+  useEffect(() => {
+    async function loadNotifications() {
+      try {
+        const response = await apiRequest<{ notifications: EmployeeNotification[] }>("/api/notifications");
+        setNotifications(response.notifications);
+      } catch {
+        setNotifications([]);
+      }
+    }
+
+    if (currentUser) {
+      loadNotifications();
+    }
+  }, [currentUser]);
 
   useEffect(() => {
   let interval: NodeJS.Timeout;
@@ -60,18 +128,7 @@ function formatTime(totalSeconds: number) {
 useEffect(() => {
   async function restoreSession() {
     try {
-      const token = localStorage.getItem("ewtpma_token");
-
-      const response = await fetch(
-        "http://localhost:5000/api/tracking/active-session",
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      const data = await response.json();
+      const data = await apiRequest<ActiveSessionResponse>("/api/tracking/active-session");
 
       if (!data.activeSession) return;
 
@@ -114,12 +171,8 @@ useEffect(() => {
 
       if (idleDurationSeconds > 0 && sessionId) {
         setIdleSeconds((prev) => prev + idleDurationSeconds);
-        fetch("http://localhost:5000/api/tracking/event", {
+        apiRequest("/api/tracking/event", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${localStorage.getItem("ewtpma_token")}`,
-          },
           body: JSON.stringify({
             sessionId,
             type: "IDLE_END",
@@ -167,12 +220,8 @@ useEffect(() => {
       setIsIdle(true);
       setIdleStartedAt(Date.now());
       if (sessionId) {
-        fetch("http://localhost:5000/api/tracking/event", {
+        apiRequest("/api/tracking/event", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${localStorage.getItem("ewtpma_token")}`,
-          },
           body: JSON.stringify({
             sessionId,
             type: "IDLE_START",
@@ -214,37 +263,22 @@ useEffect(() => {
   try {
     setLoading(true);
 
-    const token = localStorage.getItem("ewtpma_token");
-
-    const response = await fetch(
-      "http://localhost:5000/api/tracking/start",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      toast.error(data.message || "Failed to start tracking");
-      return;
-    }
+    const data = await apiRequest<TrackingSessionResponse>("/api/tracking/start", {
+      method: "POST",
+    });
 
     setIsTracking(true);
     setSessionId(data.session.id);
     setElapsedSeconds(0);
     setBreakSeconds(0);
     setIdleSeconds(0);
+    setLastProductivityPercent(null);
 
     toast.success("Work session started successfully");
   } catch (error) {
     console.error(error);
 
-    toast.error("Something went wrong");
+    toast.error(error instanceof Error ? error.message : "Something went wrong");
   } finally {
     setLoading(false);
   }
@@ -258,45 +292,34 @@ async function handleClockOut() {
 
     setLoading(true);
 
-    const token = localStorage.getItem("ewtpma_token");
-
-    const response = await fetch(
-      "http://localhost:5000/api/tracking/stop",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          sessionId,
-          activeMinutes: Math.round(productiveSeconds / 60),
-          idleMinutes: Math.round(idleSeconds / 60),
-          breakMinutes: Math.round(breakSeconds / 60),
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      toast.error(data.message || "Failed to stop tracking");
-      return;
-    }
+    const result = await apiRequest<{ productivity?: { productivityPercent?: number } }>("/api/tracking/stop", {
+      method: "POST",
+      body: JSON.stringify({
+        sessionId,
+        activeMinutes: Math.round(productiveSeconds / 60),
+        idleMinutes: Math.round(idleSeconds / 60),
+        breakMinutes: Math.round(breakSeconds / 60),
+      }),
+    });
 
     setIsTracking(false);
     setSessionId(null);
     setElapsedSeconds(0);
-setIsOnBreak(false);
+    setIsOnBreak(false);
     setBreakStartedAt(null);
     setBreakSeconds(0);
     setIdleSeconds(0);
+    setLastProductivityPercent(
+      typeof result.productivity?.productivityPercent === "number"
+        ? Math.round(result.productivity.productivityPercent)
+        : null,
+    );
 
     toast.success("Work session ended successfully");
   } catch (error) {
     console.error(error);
 
-    toast.error("Something went wrong");
+    toast.error(error instanceof Error ? error.message : "Something went wrong");
   } finally {
     setLoading(false);
   }
@@ -308,36 +331,19 @@ async function handleBreakToggle() {
       return;
     }
 
-    const token = localStorage.getItem("ewtpma_token");
-
     const durationSeconds =
       isOnBreak && breakStartedAt
         ? Math.max(1, Math.round((Date.now() - breakStartedAt) / 1000))
         : undefined;
 
-    const response = await fetch(
-      "http://localhost:5000/api/tracking/event",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-
-        body: JSON.stringify({
-          sessionId,
-          type: isOnBreak ? "BREAK_END" : "BREAK_START",
-          durationSeconds,
-        }),
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      toast.error(data.message || "Failed to update break status");
-      return;
-    }
+    await apiRequest("/api/tracking/event", {
+      method: "POST",
+      body: JSON.stringify({
+        sessionId,
+        type: isOnBreak ? "BREAK_END" : "BREAK_START",
+        durationSeconds,
+      }),
+    });
 
     if (isOnBreak && durationSeconds) {
       setBreakSeconds((prev) => prev + durationSeconds);
@@ -356,9 +362,33 @@ async function handleBreakToggle() {
   } catch (error) {
     console.error(error);
 
-    toast.error("Something went wrong");
+    toast.error(error instanceof Error ? error.message : "Something went wrong");
   }
 }
+
+function handleLogout() {
+  clearAuth();
+  router.push("/login");
+}
+
+async function handleMarkAsRead(id: number) {
+  setMarkingNotificationId(id);
+
+  try {
+    await apiRequest(`/api/notifications/${id}/read`, {
+      method: "PATCH",
+    });
+
+    setNotifications((items) =>
+      items.map((item) => (item.id === id ? { ...item, isRead: true } : item)),
+    );
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : "Could not mark notification as read");
+  } finally {
+    setMarkingNotificationId(null);
+  }
+}
+
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#020617] text-white">
       {/* Background gradients */}
@@ -370,20 +400,56 @@ async function handleBreakToggle() {
         {/* Top Header */}
         <div className="mx-auto max-w-7xl">
           {/* Pill */}
-          <div className="inline-flex items-center gap-2 rounded-full border border-blue-400/20 bg-gradient-to-r from-blue-500/10 to-cyan-400/10 px-6 py-2 text-sm font-semibold tracking-wide text-blue-100 shadow-lg shadow-blue-500/10 backdrop-blur-2xl">
-            <Sparkles
-              size={16}
-              className="text-cyan-300"
-            />
+          <div className="flex items-center justify-between gap-4">
+            <div className="inline-flex items-center gap-2 rounded-full border border-blue-400/20 bg-gradient-to-r from-blue-500/10 to-cyan-400/10 px-6 py-2 text-sm font-semibold tracking-wide text-blue-100 shadow-lg shadow-blue-500/10 backdrop-blur-2xl">
+              <Sparkles
+                size={16}
+                className="text-cyan-300"
+              />
 
-            Employee Workspace
+              Employee Workspace
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-slate-300 hover:bg-white/10"
+                onClick={() => setNotificationOpen(true)}
+                type="button"
+                aria-label="Open notifications"
+              >
+                <Bell size={17} />
+                {unreadCount > 0 && (
+                  <span className="absolute -right-1 -top-1 flex min-h-5 min-w-5 items-center justify-center rounded-full bg-cyan-300 px-1.5 text-xs font-bold text-slate-950">
+                    {unreadCount}
+                  </span>
+                )}
+              </button>
+
+              <button
+                className="flex h-10 items-center gap-2 rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
+                onClick={() => router.push("/employee/leave")}
+                type="button"
+              >
+                <CalendarDays size={17} />
+                Leave
+              </button>
+
+              <button
+                className="flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 text-sm font-semibold text-slate-300 hover:bg-white/10"
+                onClick={handleLogout}
+                type="button"
+              >
+                <LogOut size={17} />
+                Logout
+              </button>
+            </div>
           </div>
           
 
           {/* Heading */}
           <div className="mt-8">
             <h1 className="text-5xl font-semibold tracking-[-0.04em] text-white md:text-6xl">
-              Welcome back.
+              Welcome back{currentUser ? `, ${currentUser.firstName}` : ""}.
             </h1>
 
             <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-300">
@@ -449,7 +515,11 @@ async function handleBreakToggle() {
               </p>
 
               <h2 className="mt-5 text-3xl font-semibold bg-gradient-to-r from-blue-400 to-cyan-300 bg-clip-text text-transparent">
-                {productivityPercent}%
+                {isTracking
+                  ? `${productivityPercent}%`
+                  : lastProductivityPercent !== null
+                    ? `${lastProductivityPercent}%`
+                    : "--"}
               </h2>
             </div>
           </div>
@@ -565,9 +635,81 @@ async function handleBreakToggle() {
                 </p>
               </div>
             </button>
+
           </div>
           </div>
       </section>
+
+      {notificationOpen && (
+        <div className="fixed inset-0 z-50">
+          <button
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setNotificationOpen(false)}
+            type="button"
+            aria-label="Close notifications"
+          />
+
+          <aside className="absolute right-0 top-0 h-full w-full max-w-md border-l border-white/10 bg-[#020617] p-6 shadow-2xl">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-semibold text-white">Notifications</h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  {unreadCount} unread update{unreadCount === 1 ? "" : "s"}
+                </p>
+              </div>
+
+              <button
+                className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-slate-300 hover:bg-white/10"
+                onClick={() => setNotificationOpen(false)}
+                type="button"
+                aria-label="Close notifications"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="mt-6 space-y-3 overflow-y-auto pr-1">
+              {notifications.length ? (
+                notifications.map((item) => (
+                  <div
+                    className={`rounded-2xl border p-4 ${
+                      item.isRead
+                        ? "border-white/10 bg-white/4"
+                        : "border-cyan-300/20 bg-cyan-300/10"
+                    }`}
+                    key={item.id}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="font-medium text-white">{item.title}</p>
+                        <p className="mt-1 text-sm text-slate-400">{item.message}</p>
+                      </div>
+                      {!item.isRead && (
+                        <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-cyan-300" />
+                      )}
+                    </div>
+
+                    {!item.isRead && (
+                      <button
+                        className="mt-4 rounded-xl border border-white/10 bg-white/6 px-3 py-2 text-sm font-semibold text-cyan-100 hover:bg-white/10 disabled:opacity-60"
+                        disabled={markingNotificationId === item.id}
+                        onClick={() => handleMarkAsRead(item.id)}
+                        type="button"
+                      >
+                        {markingNotificationId === item.id ? "Marking..." : "Mark as read"}
+                      </button>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <p className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-400">
+                  No notifications yet.
+                </p>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
     </main>
   );
 }

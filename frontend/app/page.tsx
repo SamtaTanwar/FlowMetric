@@ -206,12 +206,6 @@ export default function HomePage() {
           className="mt-10 flex flex-col items-center gap-4 sm:flex-row"
         >
           <Link
-            href="/signup"
-            className="rounded-2xl bg-gradient-to-r from-cyan-400 to-blue-500 px-8 py-4 text-base font-semibold text-black shadow-lg shadow-cyan-500/20 transition-all duration-300 hover:scale-105"
-          >
-            Start Free Trial
-          </Link>
-          <Link
             href="#story"
             className="rounded-2xl border border-white/15 bg-white/[0.06] px-8 py-4 text-base font-semibold text-white backdrop-blur transition-all duration-300 hover:bg-white/[0.12]"
           >

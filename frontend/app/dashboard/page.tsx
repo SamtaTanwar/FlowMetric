@@ -72,6 +72,7 @@ type EmployeeRow = {
   status: string;
   attendance: string;
   productivity: number;
+  productivityLabel: string;
   focus: string;
   tasks: string;
   loginTime?: string;
@@ -122,6 +123,7 @@ type WorkdayStats = {
   idleMinutes: number;
   productiveMinutes: number;
   productivity: number;
+  isFinalized: boolean;
 };
 
 type ApiEmployee = {
@@ -136,6 +138,7 @@ type ApiEmployee = {
     loginAt: string;
     activeMinutes: number;
     idleMinutes: number;
+    breakMinutes: number;
     productiveMinutes: number;
   }>;
   productivityRecords?: Array<{
@@ -168,6 +171,24 @@ type ApiNotification = {
   type: string;
   priority: string;
   createdAt: string;
+};
+
+type ApiLeaveRequest = {
+  id: number;
+  type: "SICK" | "CASUAL";
+  reason: string;
+  days: number;
+  paidDays: number;
+  unpaidDays: number;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+  createdAt: string;
+  user: {
+    id: number;
+    employeeCode: string;
+    firstName: string;
+    lastName: string;
+    department?: { name: string } | null;
+  };
 };
 
 type ApiLiveEmployee = {
@@ -230,15 +251,7 @@ type ApiDailyReport = {
 };
 
 // Initialize as empty — dashboard should populate from backend APIs only
-const employees: EmployeeRow[] = [];
-const productivityTrend: Array<{ day: string; productivity: number; attendance: number; tasks: number }> = [];
-const departmentData: Array<{ name: string; value: number; color: string }> = [];
-const hourlyActivity: Array<{ hour: string; keyboard: number; mouse: number }> = [];
 const activityFeed: ActivityItem[] = [];
-const reports: ReportItem[] = [];
-const workflows: WorkflowItem[] = [];
-const notifications: NotificationItem[] = [];
-const policyFallback: PolicyItem[] = [];
 
 function formatMinutes(minutes = 0) {
   const hours = Math.floor(minutes / 60);
@@ -249,6 +262,17 @@ function formatMinutes(minutes = 0) {
   }
 
   return `${hours}h ${remaining}m`;
+}
+
+function minutesFromLabel(value?: string) {
+  if (!value) {
+    return 0;
+  }
+
+  const hours = value.match(/(\d+)h/)?.[1];
+  const minutes = value.match(/(\d+)m/)?.[1];
+
+  return (hours ? Number(hours) * 60 : 0) + (minutes ? Number(minutes) : 0);
 }
 
 function formatDateTime(value?: string | null) {
@@ -276,7 +300,7 @@ function formatDate(value?: string | null) {
 
 function labelFromEnum(value?: string) {
   if (!value) {
-    return "Unknown";
+    return "Not Marked";
   }
 
   return value
@@ -286,15 +310,12 @@ function labelFromEnum(value?: string) {
     .join(" ");
 }
 
-function isLateAttendance(record: ApiAttendanceRecord | undefined | null) {
-  if (!record) {
-    return false;
+function productivityPercent(productiveMinutes: number, loginMinutes: number) {
+  if (loginMinutes <= 0) {
+    return 0;
   }
 
-  return (
-    record.status === "LATE" ||
-    (record.lateMinutes ?? 0) > 0
-  );
+  return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
 
 function timeAgo(value?: string) {
@@ -317,10 +338,17 @@ function timeAgo(value?: string) {
 
 function mapEmployee(employee: ApiEmployee): EmployeeRow {
   const session = employee.loginSessions?.[0];
+  const isActiveSession = session?.status === "ACTIVE";
   const productivity = employee.productivityRecords?.[0];
   const attendance = employee.attendanceRecords?.[0];
-  const productiveMinutes = productivity?.productiveMinutes ?? session?.productiveMinutes ?? 0;
-  const idleMinutes = productivity?.idleMinutes ?? session?.idleMinutes ?? 0;
+  const liveLoginMinutes = session ? Math.max(0, Math.round((Date.now() - new Date(session.loginAt).getTime()) / 60000)) : 0;
+  const idleMinutes = isActiveSession ? session?.idleMinutes ?? 0 : productivity?.idleMinutes ?? session?.idleMinutes ?? 0;
+  const breakMinutes = session?.breakMinutes ?? 0;
+  const liveProductiveMinutes = Math.max(0, liveLoginMinutes - idleMinutes - breakMinutes);
+  const productivityValue = isActiveSession
+    ? productivityPercent(liveProductiveMinutes, liveLoginMinutes)
+    : Math.round(productivity?.productivityPercent ?? 0);
+  const productiveMinutes = isActiveSession ? liveProductiveMinutes : productivity?.productiveMinutes ?? session?.productiveMinutes ?? 0;
   const workflowCount = employee.assignedWorkflows?.length ?? 0;
 
   return {
@@ -329,12 +357,15 @@ function mapEmployee(employee: ApiEmployee): EmployeeRow {
     name: `${employee.firstName} ${employee.lastName}`,
     role: employee.designation || "Employee",
     department: employee.department?.name || "Unassigned",
-    status: session?.status === "ACTIVE" ? "Active" : "Offline",
+    status: isActiveSession ? "Active" : "Offline",
     attendance:
-      attendance?.status === "LATE" || (attendance?.lateMinutes ?? 0) > 0
-        ? "Late"
-        : labelFromEnum(attendance?.status),
-    productivity: Math.round(productivity?.productivityPercent ?? 0),
+      attendance?.status === "HALF_DAY"
+        ? "Half Day"
+        : attendance?.status === "LATE" || (attendance?.lateMinutes ?? 0) > 0
+          ? "Late"
+          : labelFromEnum(attendance?.status),
+    productivity: productivityValue,
+    productivityLabel: `${productivityValue}%`,
     focus: formatMinutes(productiveMinutes),
     tasks: `${workflowCount} task${workflowCount === 1 ? "" : "s"}`,
     loginTime: formatDateTime(attendance?.loginAt || session?.loginAt),
@@ -383,6 +414,10 @@ function mapNotification(item: ApiNotification): NotificationItem {
   };
 }
 
+function adminNotificationsOnly(items: NotificationItem[]) {
+  return items.filter((item) => item.userId == null);
+}
+
 function mapTrackingEventToActivityItem(event: ApiTrackingEvent, employeeName: string): ActivityItem {
   const normalizedType = event.type.replace(/_/g, " ").toLowerCase();
   const title = event.detail
@@ -404,7 +439,7 @@ function mapTrackingEventToActivityItem(event: ApiTrackingEvent, employeeName: s
 
 function mapPolicies(policy?: ApiPolicy): PolicyItem[] {
   if (!policy) {
-    return policyFallback;
+    return [];
   }
 
   return [
@@ -436,12 +471,22 @@ function statusStyle(status: string) {
     return "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20";
   }
 
-  if (status === "Idle" || status === "Late" || status === "Review") {
+  if (status === "Idle" || status === "Late" || status === "Half Day" || status === "Review") {
     return "bg-amber-300/10 text-amber-200 ring-amber-300/20";
   }
 
   return "bg-slate-300/10 text-slate-300 ring-white/10";
 }
+
+const chartTooltipStyle = {
+  backgroundColor: "#ffffff",
+  border: "1px solid #cbd5e1",
+  color: "#020617",
+};
+
+const chartTooltipTextStyle = {
+  color: "#020617",
+};
 
 function KpiCard({
   title,
@@ -508,7 +553,9 @@ export default function DashboardPage() {
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [workflowItems, setWorkflowItems] = useState<WorkflowItem[]>([]);
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
-  const [liveEmployees, setLiveEmployees] = useState<ApiLiveEmployee[]>([]);
+  const [leaveRequests, setLeaveRequests] = useState<ApiLeaveRequest[]>([]);
+  const [reviewingLeaveId, setReviewingLeaveId] = useState<number | null>(null);
+  const [, setLiveEmployees] = useState<ApiLiveEmployee[]>([]);
   const [reportCards, setReportCards] = useState<ReportItem[]>([]);
   const [policyItems, setPolicyItems] = useState<PolicyItem[]>([]);
   const [attendanceRecords, setAttendanceRecords] = useState<ApiAttendanceRecord[]>([]);
@@ -544,25 +591,35 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
   });
 
   useEffect(() => {
-    if (!selectedEmployee) {
-      setWorkdayStats(null);
-      return;
-    }
+    let isCurrent = true;
 
     const fetchWorkdayStats = async () => {
+      if (!selectedEmployee) {
+        setWorkdayStats(null);
+        return;
+      }
+
       try {
         const data = await apiRequest<WorkdayStats>(
           `/api/employees/${selectedEmployee.id}/workday-stats`,
         );
 
-        setWorkdayStats(data);
+        if (isCurrent) {
+          setWorkdayStats(data);
+        }
       } catch (error) {
         console.error("Workday stats error:", error);
-        setWorkdayStats(null);
+        if (isCurrent) {
+          setWorkdayStats(null);
+        }
       }
     };
 
     fetchWorkdayStats();
+
+    return () => {
+      isCurrent = false;
+    };
   }, [selectedEmployee]);
 
   useEffect(() => {
@@ -583,27 +640,18 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
       try {
         const [
           employeesResponse,
-          productivityResponse,
           workflowsResponse,
           notificationsResponse,
+          leaveRequestsResponse,
           liveResponse,
           policiesResponse,
           dashboardStatsResponse,
           reportResponse,
         ] = await Promise.all([
           apiRequest<{ employees: ApiEmployee[] }>("/api/employees"),
-          apiRequest<{
-            averageProductivity: number;
-            departmentPerformance: Array<{ department: string; productivityPercent: number }>;
-            topEmployees: Array<{
-              userId: number;
-              name: string;
-              productivityPercent: number;
-              productiveMinutes: number;
-            }>;
-          }>("/api/productivity/summary"),
           apiRequest<{ workflows: ApiWorkflow[] }>("/api/workflows"),
           apiRequest<{ notifications: ApiNotification[] }>("/api/notifications"),
+          apiRequest<{ requests: ApiLeaveRequest[] }>("/api/leave-requests"),
           apiRequest<{ employees: ApiLiveEmployee[] }>("/api/tracking/live"),
           apiRequest<{ policies: ApiPolicy[] }>("/api/policies"),
           apiRequest<{
@@ -622,29 +670,32 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
         setCurrentUser(storedUser);
         const mappedEmployees = employeesResponse.employees.map(mapEmployee);
         const mappedWorkflows = workflowsResponse.workflows.map(mapWorkflow);
-        const mappedNotifications = notificationsResponse.notifications.map(mapNotification);
+        const mappedNotifications = adminNotificationsOnly(
+          notificationsResponse.notifications.map(mapNotification),
+        );
         const colors = ["#2563eb", "#16a34a", "#f59e0b", "#7c3aed", "#dc2626"];
 
         setEmployeeRows(mappedEmployees);
         setSelectedEmployee(mappedEmployees[0] ?? null);
         setProductivityChartData(
-          productivityResponse.topEmployees.slice(0, 8).map((employee) => ({
+          mappedEmployees.map((employee) => ({
             day: employee.name,
-            productivity: employee.productivityPercent,
-            attendance: employee.productivityPercent,
-            tasks: 0,
+            productivity: employee.productivity,
+            attendance: employee.attendance === "Present" ? 100 : employee.attendance === "Late" ? 70 : employee.attendance === "Half Day" ? 50 : 0,
+            tasks: Number.parseInt(employee.tasks, 10) || 0,
           })),
         );
         setActivityChartData(
-          reportResponse.productivity.slice(0, 8).map((record) => ({
-            hour: `${record.user.firstName} ${record.user.lastName}`,
-            keyboard: record.productiveMinutes,
-            mouse: record.idleMinutes ?? 0,
+          mappedEmployees.map((employee) => ({
+            hour: employee.name,
+            keyboard: minutesFromLabel(employee.productiveTime),
+            mouse: minutesFromLabel(employee.idleTime),
           })),
         );
         setAttendanceRecords(reportResponse.attendance);
-        setWorkflowItems(mappedWorkflows.length ? mappedWorkflows : workflows);
-        setNotificationItems(mappedNotifications.length ? mappedNotifications : notifications);
+        setWorkflowItems(mappedWorkflows);
+        setNotificationItems(mappedNotifications);
+        setLeaveRequests(leaveRequestsResponse.requests);
         setLiveEmployees(liveResponse.employees);
 
         const liveSessionEmployees = liveResponse.employees
@@ -683,15 +734,18 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
         );
         setPolicyItems(mapPolicies(policiesResponse.policies[0]));
 
-        if (productivityResponse.departmentPerformance.length) {
-          setDepartmentChartData(
-            productivityResponse.departmentPerformance.map((item, index) => ({
-              name: item.department,
-              value: item.productivityPercent,
-              color: colors[index % colors.length],
-            })),
-          );
-        }
+        const departmentCounts = mappedEmployees.reduce<Record<string, number>>((counts, employee) => {
+          counts[employee.department] = (counts[employee.department] || 0) + 1;
+          return counts;
+        }, {});
+
+        setDepartmentChartData(
+          Object.entries(departmentCounts).map(([department, count], index) => ({
+            name: department,
+            value: count,
+            color: colors[index % colors.length],
+          })),
+        );
 
         const reportDate = formatDate(reportResponse.date);
         setDashboardStats({
@@ -736,7 +790,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
           return;
         }
 
-        setApiStatus("Using demo data - start backend on port 5000");
+        setApiStatus("Backend connection failed - start backend on port 5000");
         setIsAuthorized(true);
       }
     }
@@ -782,6 +836,28 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
     }
   }
 
+  async function handleLeaveDecision(id: number, status: "APPROVED" | "REJECTED") {
+    setReviewingLeaveId(id);
+
+    try {
+      const response = await apiRequest<{ request: ApiLeaveRequest }>(`/api/leave-requests/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status }),
+      });
+
+      setLeaveRequests((items) =>
+        items.map((item) => (item.id === id ? response.request : item)),
+      );
+
+      const notificationsResponse = await apiRequest<{ notifications: ApiNotification[] }>("/api/notifications");
+      setNotificationItems(
+        adminNotificationsOnly(notificationsResponse.notifications.map(mapNotification)),
+      );
+    } finally {
+      setReviewingLeaveId(null);
+    }
+  }
+
   async function handleLogout() {
     const sessionId = getStoredSessionId();
 
@@ -809,13 +885,13 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#030712] text-slate-100">
+    <main className="relative h-screen overflow-hidden bg-[#030712] text-slate-100">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_10%,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_86%_6%,rgba(99,102,241,0.14),transparent_28%),linear-gradient(180deg,#030712,#07111f_48%,#020617)]" />
       <div className="pointer-events-none absolute inset-0 opacity-[0.06] bg-[linear-gradient(to_right,#ffffff_1px,transparent_1px),linear-gradient(to_bottom,#ffffff_1px,transparent_1px)] bg-size-[72px_72px]" />
-      <div className="relative z-10 flex min-h-screen">
+      <div className="relative z-10 flex h-screen">
         <aside className={`${
   sidebarOpen ? "w-72" : "w-20"
-} hidden border-r border-white/10 bg-white/5 px-5 py-6 shadow-2xl shadow-black/20 backdrop-blur-2xl transition-all duration-300 lg:block`} >
+} sticky top-0 hidden h-screen shrink-0 border-r border-white/10 bg-white/5 px-5 py-6 shadow-2xl shadow-black/20 backdrop-blur-2xl transition-all duration-300 lg:block`} >
        <div className="flex items-center justify-between">
 <div className="flex items-center justify-between">
   <div className="flex items-center gap-3">
@@ -893,7 +969,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
 </div>
         </aside>
 
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex h-screen min-w-0 flex-1 flex-col overflow-y-auto">
           <header className="sticky top-0 z-20 border-b border-white/10 bg-[#030712]/82 px-4 py-4 backdrop-blur-2xl md:px-8">
 
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -1011,7 +1087,10 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
                           <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
                           <XAxis dataKey="day" stroke="#94a3b8" />
                           <YAxis stroke="#94a3b8" />
-                          <Tooltip />
+                          <Tooltip
+                            contentStyle={chartTooltipStyle}
+                            labelStyle={chartTooltipTextStyle}
+                          />
                           <Area
                             dataKey="productivity"
                             fill="url(#productivityFill)"
@@ -1043,7 +1122,10 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
                               <Cell fill={entry.color} key={entry.name} />
                             ))}
                           </Pie>
-                          <Tooltip />
+                          <Tooltip
+                            contentStyle={chartTooltipStyle}
+                            labelStyle={chartTooltipTextStyle}
+                          />
                         </PieChart>
                       </ResponsiveContainer>
                     </div>
@@ -1078,10 +1160,17 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
               workdayStats={workdayStats}
             />
             )}
-            {activeTab === "attendance" && <AttendanceView records={attendanceRecords} />}
+            {activeTab === "attendance" && <AttendanceView records={attendanceRecords} rows={employeeRows} />}
             {activeTab === "activity" && <ActivityView chartData={activityChartData} rows={employeeRows} />}
             {activeTab === "workflow" && <WorkflowView items={workflowItems} />}
-            {activeTab === "notifications" && <NotificationView items={notificationItems} />}
+            {activeTab === "notifications" && (
+              <NotificationView
+                items={notificationItems}
+                leaveRequests={leaveRequests}
+                onLeaveDecision={handleLeaveDecision}
+                reviewingLeaveId={reviewingLeaveId}
+              />
+            )}
             {activeTab === "reports" && (
               <ReportsView exporting={isExporting} items={reportCards} onExport={handleExportReport} />
             )}
@@ -1161,10 +1250,10 @@ function EmployeeTable({
                     <div className="h-2 w-24 rounded-full bg-white/10">
                       <div
                         className="h-2 rounded-full bg-linear-to-r from-cyan-300 to-indigo-300"
-                        style={{ width: `${employee.productivity}%` }}
+                        style={{ width: `${employee.productivity ?? 0}%` }}
                       />
                     </div>
-                    <span className="font-medium text-slate-200">{employee.productivity}%</span>
+                    <span className="font-medium text-slate-200">{employee.productivityLabel}</span>
                   </div>
                 </td>
                 <td className="px-4 py-4 text-slate-300">{employee.focus}</td>
@@ -1238,6 +1327,7 @@ function EmployeeSelfDashboard({
       </SectionCard>
     );
   }
+const productivityValue = workdayStats?.productivity ?? employee.productivity ?? 0;
 const summary = [
   {
     label: "Login Time",
@@ -1288,10 +1378,12 @@ const summary = [
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-sm font-semibold text-cyan-100">Today&apos;s Productivity</p>
-              <p className="mt-1 text-3xl font-semibold text-white">{workdayStats?.productivity || 0}%</p>
+              <p className="mt-1 text-3xl font-semibold text-white">
+                {productivityValue}%
+              </p>
             </div>
             <div className="h-3 w-full rounded-full bg-white/10 sm:w-64">
-              <div className="h-3 rounded-full bg-linear-to-r from-cyan-300 to-indigo-300" style={{ width: `${workdayStats?.productivity || 0}%` }} />
+              <div className="h-3 rounded-full bg-linear-to-r from-cyan-300 to-indigo-300" style={{ width: `${productivityValue ?? 0}%` }} />
             </div>
           </div>
         </div>
@@ -1312,25 +1404,34 @@ const summary = [
   );
 }
 
-function AttendanceView({ records = [] }: { records?: ApiAttendanceRecord[] }) {
-  const attendanceChartData = records.map((record) => ({
-    day: `${record.user.firstName} ${record.user.lastName}`,
-    attendance: isLateAttendance(record)
+function AttendanceView({
+  records = [],
+  rows = [],
+}: {
+  records?: ApiAttendanceRecord[];
+  rows?: EmployeeRow[];
+}) {
+  const attendanceChartData = rows.map((employee) => ({
+    day: employee.name,
+    attendance: employee.attendance === "Late"
       ? 70
-      : record.status === "PRESENT"
+      : employee.attendance === "Present"
         ? 100
-        : record.status === "ABSENT"
-          ? 20
-          : 50,
+        : employee.attendance === "Half Day"
+          ? 50
+          : employee.attendance === "Absent"
+            ? 20
+            : 0,
   }));
 
-  const exceptionRecords = records.filter((record) => !record || isLateAttendance(record) || record.status === "ABSENT");
+  const exceptionRows = rows.filter((employee) => employee.attendance !== "Present");
+  const recordByEmployeeCode = new Map(records.map((record) => [record.user.employeeCode, record]));
 
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
       <SectionCard title="Team Attendance Overview">
         <p className="mb-4 text-sm text-slate-400">
-          This chart now uses real attendance records from the daily report API.
+          This chart uses today&apos;s employee attendance state from the dashboard API.
         </p>
         <div className="h-80">
           <ResponsiveContainer height="100%" width="100%">
@@ -1338,7 +1439,10 @@ function AttendanceView({ records = [] }: { records?: ApiAttendanceRecord[] }) {
               <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
               <XAxis dataKey="day" stroke="#94a3b8" />
               <YAxis stroke="#94a3b8" />
-              <Tooltip />
+              <Tooltip
+                contentStyle={chartTooltipStyle}
+                labelStyle={chartTooltipTextStyle}
+              />
               <Bar dataKey="attendance" fill="#34d399" name="Attendance %" radius={[6, 6, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
@@ -1350,18 +1454,24 @@ function AttendanceView({ records = [] }: { records?: ApiAttendanceRecord[] }) {
           Employees who are not marked Present today appear here.
         </p>
         <div className="space-y-3">
-          {exceptionRecords.length > 0 ? (
-            exceptionRecords.map((record) => (
-              <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={`${record.user.employeeCode}-${record.status}`}>
+          {exceptionRows.length > 0 ? (
+            exceptionRows.map((employee) => {
+              const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
+
+              return (
+              <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={`${employee.employeeCode || employee.name}-${employee.attendance}`}>
                 <div className="flex items-center justify-between gap-3">
-                  <p className="font-semibold text-white">{record.user.firstName} {record.user.lastName}</p>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(labelFromEnum(record.status))}`}>
-                    {labelFromEnum(record.status)}
+                  <p className="font-semibold text-white">{employee.name}</p>
+                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(employee.attendance)}`}>
+                    {employee.attendance}
                   </span>
                 </div>
-                <p className="mt-1 text-sm text-slate-400">{record.user.department?.name || "Unassigned"}</p>
+                <p className="mt-1 text-sm text-slate-400">
+                  {record?.user.department?.name || employee.department || "Unassigned"}
+                </p>
               </div>
-            ))
+              );
+            })
           ) : (
             <div className="rounded-2xl border border-white/10 bg-white/4 p-4 text-center text-sm text-slate-400">
               All employees are present today.
@@ -1381,16 +1491,13 @@ function ActivityView({
   rows?: EmployeeRow[];
 }) {
   const activeSessions = rows.filter((employee) => employee.status === "Active").length;
-  const idleMinutes = rows.reduce((sum, employee) => {
-    const match = employee.idleTime?.match(/\d+/);
-    return sum + (match ? Number(match[0]) : 0);
-  }, 0);
+  const idleMinutes = rows.reduce((sum, employee) => sum + minutesFromLabel(employee.idleTime), 0);
 
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
       <SectionCard title="Recorded Activity Signals">
         <p className="mb-4 text-sm text-slate-400">
-          This is a monitoring chart for activity events. In the web prototype, employee idle time is tracked from browser page activity.
+          This chart uses each employee&apos;s tracked productive and idle minutes.
         </p>
         <div className="h-80">
           <ResponsiveContainer height="100%" width="100%">
@@ -1398,9 +1505,12 @@ function ActivityView({
               <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
               <XAxis dataKey="hour" stroke="#94a3b8" />
               <YAxis stroke="#94a3b8" />
-              <Tooltip />
-              <Line dataKey="keyboard" name="Keyboard" stroke="#22d3ee" strokeWidth={3} type="monotone" />
-              <Line dataKey="mouse" name="Mouse" stroke="#34d399" strokeWidth={3} type="monotone" />
+              <Tooltip
+                contentStyle={chartTooltipStyle}
+                labelStyle={chartTooltipTextStyle}
+              />
+              <Line dataKey="keyboard" name="Productive Time" stroke="#22d3ee" strokeWidth={3} type="monotone" />
+              <Line dataKey="mouse" name="Idle Time" stroke="#34d399" strokeWidth={3} type="monotone" />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -1473,9 +1583,69 @@ function WorkflowView({ items = [] }: { items?: WorkflowItem[] }) {
   );
 }
 
-function NotificationView({ items = [] }: { items?: NotificationItem[] }) {
+function NotificationView({
+  items = [],
+  leaveRequests = [],
+  onLeaveDecision,
+  reviewingLeaveId,
+}: {
+  items?: NotificationItem[];
+  leaveRequests?: ApiLeaveRequest[];
+  onLeaveDecision?: (id: number, status: "APPROVED" | "REJECTED") => void;
+  reviewingLeaveId?: number | null;
+}) {
+  const pendingLeaveRequests = leaveRequests.filter((request) => request.status === "PENDING");
+
   return (
     <SectionCard title="Notification Center">
+      {pendingLeaveRequests.length > 0 && (
+        <div className="mb-6 grid gap-4 lg:grid-cols-2">
+          {pendingLeaveRequests.map((request) => (
+            <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-5" key={request.id}>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase text-amber-100">Leave Request</p>
+                  <h3 className="mt-1 font-semibold text-white">
+                    {request.user.firstName} {request.user.lastName}
+                  </h3>
+                  <p className="mt-1 text-sm text-slate-300">
+                    {labelFromEnum(request.type)} · {request.days} day{request.days === 1 ? "" : "s"} - {request.reason}
+                  </p>
+                  <p className="mt-1 text-sm text-cyan-100">
+                    {request.paidDays} paid · {request.unpaidDays} unpaid
+                  </p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {request.user.department?.name || "Unassigned"} · {timeAgo(request.createdAt)}
+                  </p>
+                </div>
+                <span className="rounded-full bg-amber-300/10 px-2.5 py-1 text-xs font-semibold text-amber-100 ring-1 ring-amber-300/20">
+                  Pending
+                </span>
+              </div>
+
+              <div className="mt-4 flex gap-3">
+                <button
+                  className="rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-300 disabled:opacity-60"
+                  disabled={reviewingLeaveId === request.id}
+                  onClick={() => onLeaveDecision?.(request.id, "APPROVED")}
+                  type="button"
+                >
+                  Approve
+                </button>
+                <button
+                  className="rounded-xl bg-rose-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-rose-300 disabled:opacity-60"
+                  disabled={reviewingLeaveId === request.id}
+                  onClick={() => onLeaveDecision?.(request.id, "REJECTED")}
+                  type="button"
+                >
+                  Reject
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-2">
         {items.map((item) => {
           const Icon =
@@ -1488,7 +1658,7 @@ function NotificationView({ items = [] }: { items?: NotificationItem[] }) {
                 : "bg-rose-300/10 text-rose-200 ring-1 ring-rose-300/20";
 
           return (
-            <div className="flex gap-4 rounded-2xl border border-white/10 bg-white/4 p-5" key={item.title}>
+            <div className="flex gap-4 rounded-2xl border border-white/10 bg-white/4 p-5" key={item.id}>
               <div className={`flex size-10 shrink-0 items-center justify-center rounded-xl ${color}`}>
                 <Icon size={19} />
               </div>

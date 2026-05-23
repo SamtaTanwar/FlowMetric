@@ -1,6 +1,8 @@
 
 "use client";
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { apiRequest, getStoredToken, getStoredUser } from "@/lib/api";
 
 type ProductivityRecord = {
   id: number;
@@ -17,61 +19,44 @@ type TrackingEvent = {
 };
 
 export default function EmployeeReportsPage() {
+  const router = useRouter();
   const [records, setRecords] = useState<ProductivityRecord[]>([]);
   const [events, setEvents] = useState<TrackingEvent[]>([]);
   const latestRecord = records[0];
+
   useEffect(() => {
   async function fetchProductivity() {
     try {
-      const token = localStorage.getItem("ewtpma_token");
+      const token = getStoredToken();
+      const storedUser = getStoredUser();
 
-      const storedUser = localStorage.getItem("ewtpma_user");
+      if (!token) {
+        router.replace("/login");
+        return;
+      }
 
-const employeeId = storedUser
-  ? JSON.parse(storedUser).id
-  : null;
+      if (!storedUser || storedUser.role !== "EMPLOYEE") {
+        router.replace("/dashboard");
+        return;
+      }
 
-      const response = await fetch(
-        `http://localhost:5000/api/productivity/employee/${employeeId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
+      const data = await apiRequest<{ records: ProductivityRecord[] }>(
+        `/api/productivity/employee/${storedUser.id}`,
       );
 
-      const data = await response.json();
-
-      console.log(data);
-
       setRecords(data.records || []);
-      const latestSessionResponse = await fetch(
-  "http://localhost:5000/api/tracking/latest-session",
-  {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  }
-);
-
-const latestSessionData =
-  await latestSessionResponse.json();
+      const latestSessionData = await apiRequest<{
+        latestSession: { id: number } | null;
+      }>("/api/tracking/latest-session");
 
 if (!latestSessionData.latestSession) return;
 
 const latestSessionId =
   latestSessionData.latestSession.id;
 
-const eventsResponse = await fetch(
-  `http://localhost:5000/api/tracking/events/${latestSessionId}`,
-  {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  }
+const eventsData = await apiRequest<{ events: TrackingEvent[] }>(
+  `/api/tracking/events/${latestSessionId}`,
 );
-
-const eventsData = await eventsResponse.json();
 
 setEvents(eventsData.events || []);
    
@@ -81,7 +66,7 @@ setEvents(eventsData.events || []);
   }
 
   fetchProductivity();
-}, []);
+}, [router]);
 function getEventDetails(type: string) {
   switch (type) {
     case "LOGIN":

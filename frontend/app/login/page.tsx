@@ -29,7 +29,6 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [formVisible, setFormVisible] = useState(false);
   const [showMessage, setShowMessage] = useState(true);
