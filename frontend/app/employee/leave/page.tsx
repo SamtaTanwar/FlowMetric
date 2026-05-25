@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Send } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { apiRequest, getStoredToken, getStoredUser } from "@/lib/api";
+import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser } from "@/lib/api";
 
 export default function LeaveRequestPage() {
   const router = useRouter();
@@ -14,15 +14,16 @@ export default function LeaveRequestPage() {
   const [isSending, setIsSending] = useState(false);
 
   useEffect(() => {
-    const token = getStoredToken();
     const user = getStoredUser();
 
-    if (!token) {
+    if (!canOpenProtectedRoute("/employee/leave")) {
+      clearAuth();
       router.replace("/login");
       return;
     }
 
     if (user?.role !== "EMPLOYEE") {
+      allowProtectedNavigation("/dashboard");
       router.replace("/dashboard");
     }
   }, [router]);
@@ -48,6 +49,7 @@ export default function LeaveRequestPage() {
       });
 
       toast.success("Leave request sent to admin");
+      allowProtectedNavigation("/employee");
       router.push("/employee");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Could not send leave request");
@@ -64,7 +66,10 @@ export default function LeaveRequestPage() {
       <section className="relative z-10 mx-auto max-w-3xl">
         <button
           className="mb-8 flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 text-sm font-semibold text-slate-300 hover:bg-white/10"
-          onClick={() => router.push("/employee")}
+          onClick={() => {
+            allowProtectedNavigation("/employee");
+            router.push("/employee");
+          }}
           type="button"
         >
           <ArrowLeft size={17} />

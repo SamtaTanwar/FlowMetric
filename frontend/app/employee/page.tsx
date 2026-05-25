@@ -11,11 +11,14 @@ import {
   X,
 } from "lucide-react";
 
-import { useEffect , useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import {
+  API_BASE_URL,
   apiRequest,
+  allowProtectedNavigation,
+  canOpenProtectedRoute,
   clearAuth,
   getStoredToken,
   getStoredUser,
@@ -49,6 +52,15 @@ type EmployeeNotification = {
   isRead: boolean;
 };
 
+declare global {
+  interface Window {
+    desktopTracker?: {
+      start(config: { apiBaseUrl: string; token: string; sessionId: number }): Promise<{ ok: boolean }>;
+      stop(): Promise<{ ok: boolean }>;
+    };
+  }
+}
+
 const BREAK_ALLOWANCE_SECONDS = 45 * 60;
 
 export default function EmployeeDashboard() {
@@ -72,6 +84,7 @@ export default function EmployeeDashboard() {
   const [notifications, setNotifications] = useState<EmployeeNotification[]>([]);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [markingNotificationId, setMarkingNotificationId] = useState<number | null>(null);
+  const networkOfflineStartedAtRef = useRef<number | null>(null);
   const router = useRouter();
 
   const liveBreakSeconds =
@@ -89,11 +102,11 @@ export default function EmployeeDashboard() {
 
   useEffect(() => {
     async function verifyEmployee() {
-      const token = getStoredToken();
       const storedUser = getStoredUser();
 
-      if (!token) {
-        router.replace("/");
+      if (!canOpenProtectedRoute("/employee")) {
+        clearAuth();
+        router.replace("/login");
         return;
       }
 
@@ -102,6 +115,7 @@ export default function EmployeeDashboard() {
         const user = response.user || storedUser;
 
         if (user?.role !== "EMPLOYEE") {
+          allowProtectedNavigation("/dashboard");
           router.replace("/dashboard");
           return;
         }
@@ -110,7 +124,7 @@ export default function EmployeeDashboard() {
         setIsAuthorized(true);
       } catch {
         clearAuth();
-        router.replace("/");
+        router.replace("/login");
       }
     }
 
@@ -194,8 +208,78 @@ useEffect(() => {
 
   restoreSession();
 }, [isAuthorized]);
+
+useEffect(() => {
+  if (!isTracking || !sessionId) {
+    return;
+  }
+
+  window.desktopTracker?.start({
+    apiBaseUrl: API_BASE_URL,
+    token: getStoredToken(),
+    sessionId,
+  }).catch(() => null);
+
+  return () => {
+    window.desktopTracker?.stop().catch(() => null);
+  };
+}, [isTracking, sessionId]);
+
+useEffect(() => {
+  if (!isTracking || !sessionId) {
+    return;
+  }
+
+  const recordNetworkInterruption = (startedAt: number, endedAt = Date.now()) => {
+    const durationSeconds = Math.max(1, Math.round((endedAt - startedAt) / 1000));
+
+    apiRequest("/api/tracking/event", {
+      method: "POST",
+      body: JSON.stringify({
+        sessionId,
+        type: "APP_USAGE",
+        durationSeconds,
+        appName: "Network interruption",
+        windowTitle: "Offline / disconnected",
+        metadata: {
+          category: "NETWORK_INTERRUPTION",
+          source: "browser-network-status",
+        },
+      }),
+    }).catch(() => null);
+  };
+
+  const handleOffline = () => {
+    if (!networkOfflineStartedAtRef.current) {
+      networkOfflineStartedAtRef.current = Date.now();
+    }
+  };
+
+  const handleOnline = () => {
+    if (!networkOfflineStartedAtRef.current) {
+      return;
+    }
+
+    recordNetworkInterruption(networkOfflineStartedAtRef.current);
+    networkOfflineStartedAtRef.current = null;
+  };
+
+  if (!navigator.onLine) {
+    handleOffline();
+  }
+
+  window.addEventListener("offline", handleOffline);
+  window.addEventListener("online", handleOnline);
+
+  return () => {
+    window.removeEventListener("offline", handleOffline);
+    window.removeEventListener("online", handleOnline);
+  };
+}, [isTracking, sessionId]);
+
   useEffect(() => {
   if (!isTracking || isOnBreak) return;
+  if (window.desktopTracker) return;
 
   const handleActivity = () => {
     setLastActivityTime(Date.now());
@@ -329,6 +413,8 @@ async function handleClockOut() {
 
     setLoading(true);
 
+    await window.desktopTracker?.stop().catch(() => null);
+
     const result = await apiRequest<{ productivity?: { productivityPercent?: number } }>("/api/tracking/stop", {
       method: "POST",
       body: JSON.stringify({
@@ -405,8 +491,14 @@ async function handleBreakToggle() {
 }
 
 function handleLogout() {
+  window.desktopTracker?.stop().catch(() => null);
   clearAuth();
   router.push("/login");
+}
+
+function openProtectedPage(path: string) {
+  allowProtectedNavigation(path);
+  router.push(path);
 }
 
 async function handleMarkAsRead(id: number) {
@@ -475,7 +567,7 @@ if (!isAuthorized) {
 
               <button
                 className="flex h-10 items-center gap-2 rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
-                onClick={() => router.push("/employee/leave")}
+                onClick={() => openProtectedPage("/employee/leave")}
                 type="button"
               >
                 <CalendarDays size={17} />
@@ -664,7 +756,7 @@ if (!isAuthorized) {
 
                         {/* View Reports */}
             <button
-  onClick={() => router.push("/employee/reports")}
+  onClick={() => openProtectedPage("/employee/reports")}
   className="group relative overflow-hidden rounded-[32px] border border-blue-400/20 bg-blue-500/10 p-8 text-left backdrop-blur-2xl transition-all duration-300 hover:-translate-y-1 hover:border-blue-400/40 hover:bg-blue-500/15"
 >
               <div className="absolute right-[-30px] top-[-30px] h-32 w-32 rounded-full bg-blue-400/10 blur-3xl transition-all duration-500 group-hover:scale-150" />

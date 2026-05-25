@@ -24,6 +24,7 @@
     },
     "files": [
       "electron.js",
+      "preload.js",
       "package.json",
       "out/**/*"
     ],

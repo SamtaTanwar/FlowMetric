@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiRequest, getStoredToken, getStoredUser } from "@/lib/api";
+import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser } from "@/lib/api";
 
 type ProductivityRecord = {
   id: number;
@@ -126,18 +126,20 @@ export default function EmployeeReportsPage() {
 
   useEffect(() => {
     let isCurrent = true;
+    const hasRouteAccess = canOpenProtectedRoute("/employee/reports");
 
     async function fetchProductivity() {
       try {
-        const token = getStoredToken();
         const storedUser = getStoredUser();
 
-        if (!token) {
+        if (!hasRouteAccess) {
+          clearAuth();
           router.replace("/login");
           return;
         }
 
         if (!storedUser || storedUser.role !== "EMPLOYEE") {
+          allowProtectedNavigation("/dashboard");
           router.replace("/dashboard");
           return;
         }

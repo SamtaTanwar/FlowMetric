@@ -31,6 +31,7 @@ const prisma = new PrismaClient();
 const jwtSecret = process.env.JWT_SECRET || "employee_workflow_secret_key";
 const adminLikeRoles: UserRole[] = [UserRole.ADMIN, UserRole.MANAGER, UserRole.HR];
 const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
+const IDLE_THRESHOLD_MINUTES = 5;
 
 type AuthUser = {
   id: number;
@@ -438,6 +439,211 @@ function requireRoles(...roles: UserRole[]): RequestHandler {
   };
 }
 
+const UNPRODUCTIVE_USAGE_KEYWORDS = [
+  "youtube",
+  "netflix",
+  "prime video",
+  "hotstar",
+  "disney+",
+  "spotify",
+  "wynk",
+  "gaana",
+  "jiosaavn",
+  "vlc",
+  "media player",
+  "movie",
+  "music",
+  "song",
+  "game",
+  "gaming",
+  "steam",
+  "epic games",
+  "valorant",
+  "pubg",
+  "free fire",
+  "minecraft",
+  "roblox",
+  "facebook",
+  "instagram",
+  "whatsapp",
+  "telegram",
+  "twitter",
+  "x.com",
+  "reddit",
+];
+
+function metadataValue(metadata: Prisma.JsonValue | null | undefined, key: string) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return "";
+  }
+
+  const value = metadata[key];
+  return typeof value === "string" ? value : "";
+}
+
+function appUsageCategory(input: {
+  appName?: string | null;
+  windowTitle?: string | null;
+  metadata?: Prisma.JsonValue | null;
+}) {
+  const explicitCategory = metadataValue(input.metadata, "category").toLowerCase();
+
+  if (explicitCategory.includes("network")) {
+    return "NETWORK";
+  }
+
+  if (explicitCategory.includes("unproductive")) {
+    return "UNPRODUCTIVE";
+  }
+
+  if (explicitCategory.includes("productive")) {
+    return "PRODUCTIVE";
+  }
+
+  const text = [
+    input.appName,
+    input.windowTitle,
+    metadataValue(input.metadata, "url"),
+    metadataValue(input.metadata, "domain"),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return UNPRODUCTIVE_USAGE_KEYWORDS.some((keyword) => text.includes(keyword))
+    ? "UNPRODUCTIVE"
+    : "PRODUCTIVE";
+}
+
+async function nonWorkingUsageMinutesForSession(sessionId: number) {
+  const events = await prisma.trackingEvent.findMany({
+    where: {
+      sessionId,
+      type: TrackingEventType.APP_USAGE,
+    },
+    select: {
+      appName: true,
+      windowTitle: true,
+      metadata: true,
+      durationSeconds: true,
+    },
+  });
+
+  const seconds = events.reduce((sum, event) => {
+    const category = appUsageCategory(event);
+
+    if (category !== "UNPRODUCTIVE" && category !== "NETWORK") {
+      return sum;
+    }
+
+    return sum + (event.durationSeconds ?? 0);
+  }, 0);
+
+  return Math.round(seconds / 60);
+}
+
+async function idleMinutesWithOpenIdle(sessionId: number, storedIdleMinutes: number, endAt: Date) {
+  const latestIdleEvent = await prisma.trackingEvent.findFirst({
+    where: {
+      sessionId,
+      type: {
+        in: [TrackingEventType.IDLE_START, TrackingEventType.IDLE_END],
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (latestIdleEvent?.type !== TrackingEventType.IDLE_START) {
+    return storedIdleMinutes;
+  }
+
+  return storedIdleMinutes + minutesBetween(latestIdleEvent.createdAt, endAt);
+}
+
+function secondsFromEventPairs(
+  events: Array<{
+    type: TrackingEventType;
+    createdAt: Date;
+    durationSeconds?: number | null;
+  }>,
+  startType: TrackingEventType,
+  endType: TrackingEventType,
+  endAt: Date,
+) {
+  let startedAt: Date | null = null;
+  let totalSeconds = 0;
+
+  for (const event of events) {
+    if (event.type === startType) {
+      startedAt = event.createdAt;
+    }
+
+    if (event.type === endType && startedAt) {
+      totalSeconds += event.durationSeconds
+        ? Number(event.durationSeconds)
+        : Math.max(0, Math.round((event.createdAt.getTime() - startedAt.getTime()) / 1000));
+      startedAt = null;
+    }
+  }
+
+  if (startedAt) {
+    totalSeconds += Math.max(0, Math.round((endAt.getTime() - startedAt.getTime()) / 1000));
+  }
+
+  return totalSeconds;
+}
+
+function lastWorkActivityAt(
+  events: Array<{
+    type: TrackingEventType;
+    createdAt: Date;
+  }>,
+  fallback: Date,
+) {
+  const workActivityTypes = new Set<TrackingEventType>([
+    TrackingEventType.LOGIN,
+    TrackingEventType.IDLE_END,
+    TrackingEventType.BREAK_END,
+    TrackingEventType.APP_USAGE,
+    TrackingEventType.KEYBOARD,
+    TrackingEventType.MOUSE,
+    TrackingEventType.SCREEN_UNLOCK,
+  ]);
+  const workEvents = events.filter((event) =>
+    workActivityTypes.has(event.type),
+  );
+
+  return workEvents.at(-1)?.createdAt ?? fallback;
+}
+
+function trailingIdleSecondsAfterLastActivity(
+  events: Array<{
+    type: TrackingEventType;
+    createdAt: Date;
+  }>,
+  loginAt: Date,
+  endAt: Date,
+) {
+  const latestEvent = events.at(-1);
+
+  if (latestEvent?.type === TrackingEventType.IDLE_START) {
+    return 0;
+  }
+
+  if (latestEvent?.type === TrackingEventType.BREAK_START) {
+    return 0;
+  }
+
+  const lastActivityAt = lastWorkActivityAt(events, loginAt);
+  const idleStartedAt = new Date(lastActivityAt.getTime() + IDLE_THRESHOLD_MINUTES * 60 * 1000);
+
+  if (idleStartedAt.getTime() >= endAt.getTime()) {
+    return 0;
+  }
+
+  return Math.round((endAt.getTime() - idleStartedAt.getTime()) / 1000);
+}
+
 async function finalizeSession(
   sessionId: number,
   input: {
@@ -445,6 +651,7 @@ async function finalizeSession(
     idleMinutes?: number;
     breakMinutes?: number;
     lockMinutes?: number;
+    logoutAt?: Date;
   } = {},
 ) {
   const session = await prisma.loginSession.findUnique({
@@ -456,19 +663,25 @@ async function finalizeSession(
     throw new Error("Tracking session not found");
   }
 
-  const logoutAt = new Date();
+  const logoutAt = input.logoutAt ?? new Date();
   const loginMinutes = minutesBetween(session.loginAt, logoutAt);
   const idleMinutes = input.idleMinutes ?? session.idleMinutes;
   const breakMinutes = input.breakMinutes ?? session.breakMinutes;
-  const activeMinutes =
-    input.activeMinutes ?? Math.max(0, loginMinutes - idleMinutes - breakMinutes);
   const lockMinutes = input.lockMinutes ?? session.lockMinutes;
   const breakAllowanceMinutes = await getBreakAllowanceMinutes();
-  const productiveMinutes = productiveMinutesWithBreakAllowance(
-    loginMinutes,
-    idleMinutes,
-    breakMinutes,
-    breakAllowanceMinutes,
+  const nonWorkingUsageMinutes = await nonWorkingUsageMinutesForSession(session.id);
+  const activeMinutes = Math.max(
+    0,
+    (input.activeMinutes ?? loginMinutes - idleMinutes - breakMinutes) - nonWorkingUsageMinutes,
+  );
+  const productiveMinutes = Math.max(
+    0,
+    productiveMinutesWithBreakAllowance(
+      loginMinutes,
+      idleMinutes,
+      breakMinutes,
+      breakAllowanceMinutes,
+    ) - nonWorkingUsageMinutes,
   );
   const date = dayStart(session.loginAt);
 
@@ -549,6 +762,57 @@ async function finalizeSession(
   });
 
   return { session: updatedSession, productivity: record, workflows: updatedWorkflows };
+}
+
+async function finalizeStaleActiveSessions(userId?: number) {
+  const today = dayStart();
+  const sessions = await prisma.loginSession.findMany({
+    where: {
+      status: SessionStatus.ACTIVE,
+      loginAt: { lt: today },
+      ...(userId ? { userId } : {}),
+    },
+    orderBy: { loginAt: "asc" },
+  });
+
+  for (const session of sessions) {
+    const logoutAt = new Date(dayStart(session.loginAt).getTime() + 24 * 60 * 60 * 1000);
+    const events = await prisma.trackingEvent.findMany({
+      where: {
+        sessionId: session.id,
+        type: {
+          in: [
+            TrackingEventType.LOGIN,
+            TrackingEventType.IDLE_START,
+            TrackingEventType.IDLE_END,
+            TrackingEventType.BREAK_START,
+            TrackingEventType.BREAK_END,
+            TrackingEventType.APP_USAGE,
+            TrackingEventType.KEYBOARD,
+            TrackingEventType.MOUSE,
+            TrackingEventType.SCREEN_UNLOCK,
+          ],
+        },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    const idleSecondsFromEvents = secondsFromEventPairs(
+      events,
+      TrackingEventType.IDLE_START,
+      TrackingEventType.IDLE_END,
+      logoutAt,
+    );
+    const trailingIdleSeconds = trailingIdleSecondsAfterLastActivity(events, session.loginAt, logoutAt);
+    const idleMinutes = Math.max(
+      session.idleMinutes,
+      Math.round((idleSecondsFromEvents + trailingIdleSeconds) / 60),
+    );
+
+    await finalizeSession(session.id, {
+      logoutAt,
+      idleMinutes,
+    });
+  }
 }
 
 app.get("/", (_req, res) => {
@@ -695,7 +959,7 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
   }
 
   // Validate official email
-  if (!email.endsWith("@bridgegroupsolutions.com")) {
+  if (!email.endsWith("@bridgegroupsolutions.com") && !email.endsWith("@employmentexpress.org")) {
     res.status(400).json({
       message: "Use your official company email",
     });
@@ -894,6 +1158,8 @@ app.get(
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
+    await finalizeStaleActiveSessions();
+
     const today = dayStart();
     const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
 
@@ -906,12 +1172,17 @@ app.get(
         shift: true,
         loginSessions: {
           where: {
-            loginAt: {
-              gte: today,
-              lt: tomorrow,
-            },
+            OR: [
+              { status: SessionStatus.ACTIVE },
+              {
+                loginAt: {
+                  gte: today,
+                  lt: tomorrow,
+                },
+              },
+            ],
           },
-          orderBy: { loginAt: "desc" },
+          orderBy: [{ status: "asc" }, { loginAt: "desc" }],
           take: 1,
         },
         productivityRecords: {
@@ -992,6 +1263,8 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
+  await finalizeStaleActiveSessions(user.id);
+
   const existing = await prisma.loginSession.findFirst({
     where: { userId: user.id, status: SessionStatus.ACTIVE },
   });
@@ -1068,21 +1341,26 @@ app.get(
       return;
     }
 
+    await finalizeStaleActiveSessions(id);
+
     const today = dayStart();
     const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
 
     const session = await prisma.loginSession.findFirst({
       where: {
         userId: id,
-        loginAt: {
-          gte: today,
-          lt: tomorrow,
-        },
+        OR: [
+          { status: SessionStatus.ACTIVE },
+          {
+            loginAt: {
+              gte: today,
+              lt: tomorrow,
+            },
+          },
+        ],
       },
 
-      orderBy: {
-        loginAt: "desc",
-      },
+      orderBy: [{ status: "asc" }, { loginAt: "desc" }],
     });
 
     if (!session) {
@@ -1102,7 +1380,7 @@ app.get(
       where: {
         userId_date: {
           userId: id,
-          date: today,
+          date: session.status === SessionStatus.ACTIVE ? dayStart(session.loginAt) : today,
         },
       },
     });
@@ -1139,6 +1417,22 @@ app.get(
       }
     }
 
+    const nonWorkingUsageMinutes = Math.round(
+      events.reduce((sum, event) => {
+        if (event.type !== TrackingEventType.APP_USAGE) {
+          return sum;
+        }
+
+        const category = appUsageCategory(event);
+
+        if (category !== "UNPRODUCTIVE" && category !== "NETWORK") {
+          return sum;
+        }
+
+        return sum + (event.durationSeconds ?? 0);
+      }, 0) / 60,
+    );
+
     const endTime =
       session.logoutAt || new Date();
 
@@ -1149,18 +1443,25 @@ app.get(
     );
 
     const breakAllowanceMinutes = await getBreakAllowanceMinutes();
-    const productiveMinutes = productiveMinutesWithBreakAllowance(
-      totalMinutes,
-      idleMinutes,
-      session.breakMinutes,
-      breakAllowanceMinutes,
+    const activeMinutes = Math.max(
+      0,
+      totalMinutes - idleMinutes - session.breakMinutes - nonWorkingUsageMinutes,
+    );
+    const productiveMinutes = Math.max(
+      0,
+      productiveMinutesWithBreakAllowance(
+        totalMinutes,
+        idleMinutes,
+        session.breakMinutes,
+        breakAllowanceMinutes,
+      ) - nonWorkingUsageMinutes,
     );
 
     const productivity = productivityPercent(productiveMinutes, totalMinutes);
 
     res.json({
       loginTime: session.loginAt,
-      activeMinutes: productivityRecord?.activeMinutes ?? totalMinutes,
+      activeMinutes: productivityRecord?.activeMinutes ?? activeMinutes,
       idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
       productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
       productivity: productivityRecord?.productivityPercent ?? productivity,
@@ -1269,6 +1570,8 @@ app.get(
       if (!isEmployeeAccount(user)) {
         return res.status(403).json({ message: "Only employee accounts can view active sessions" });
       }
+
+      await finalizeStaleActiveSessions(user.id);
 
       const activeSession = await prisma.loginSession.findFirst({
         where: {
@@ -1423,10 +1726,304 @@ app.get(
 );
 
 app.get(
+  "/api/employees/:id/app-usage",
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const id = Number(req.params.id);
+    const requestedSessionId = req.query.sessionId ? Number(req.query.sessionId) : null;
+
+    if (!user) {
+      res.status(401).json({ message: "Authentication required" });
+      return;
+    }
+
+    if (user.id !== id && !adminLikeRoles.includes(user.role)) {
+      res.status(403).json({ message: "You can view only your own app usage" });
+      return;
+    }
+
+    await finalizeStaleActiveSessions(id);
+
+    const session = requestedSessionId
+      ? await prisma.loginSession.findFirst({
+        where: {
+          id: requestedSessionId,
+          userId: id,
+        },
+      })
+      : await prisma.loginSession.findFirst({
+        where: {
+          userId: id,
+        },
+        orderBy: [{ status: "asc" }, { loginAt: "desc" }],
+      });
+
+    if (!session) {
+      res.json({ session: null, usage: [] });
+      return;
+    }
+
+    const events = await prisma.trackingEvent.findMany({
+      where: {
+        sessionId: session.id,
+        type: TrackingEventType.APP_USAGE,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    const usageByKey = new Map<string, {
+      appName: string;
+      windowTitle: string;
+      category: string;
+      durationSeconds: number;
+      firstSeenAt: Date;
+      lastSeenAt: Date;
+    }>();
+
+    for (const event of events) {
+      const appName = event.appName || "Unknown app";
+      const windowTitle = event.windowTitle || "Unknown window";
+      const category = appUsageCategory(event);
+      const key = `${appName}\u0000${windowTitle}\u0000${category}`;
+      const existing = usageByKey.get(key);
+      const durationSeconds = event.durationSeconds ?? 0;
+
+      if (existing) {
+        existing.durationSeconds += durationSeconds;
+        existing.lastSeenAt = event.createdAt;
+      } else {
+        usageByKey.set(key, {
+          appName,
+          windowTitle,
+          category,
+          durationSeconds,
+          firstSeenAt: event.createdAt,
+          lastSeenAt: event.createdAt,
+        });
+      }
+    }
+
+    res.json({
+      session,
+      usage: Array.from(usageByKey.values())
+        .filter((item) => item.durationSeconds > 0)
+        .sort((a, b) => b.durationSeconds - a.durationSeconds),
+    });
+  }),
+);
+
+app.get(
+  "/api/admin/session-usage",
+  authenticate,
+  requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
+  asyncHandler(async (req, res) => {
+    await finalizeStaleActiveSessions();
+
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    const since = req.query.since
+      ? dayStart(String(req.query.since))
+      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+    const sessions = await prisma.loginSession.findMany({
+      where: {
+        user: { role: UserRole.EMPLOYEE },
+        OR: [
+          { status: SessionStatus.ACTIVE },
+          { loginAt: { gte: since } },
+          { logoutAt: { gte: since } },
+        ],
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            employeeCode: true,
+            firstName: true,
+            lastName: true,
+            department: true,
+          },
+        },
+        events: {
+          where: {
+            type: {
+              in: [
+                TrackingEventType.APP_USAGE,
+                TrackingEventType.IDLE_START,
+                TrackingEventType.IDLE_END,
+                TrackingEventType.BREAK_START,
+                TrackingEventType.BREAK_END,
+                TrackingEventType.LOGIN,
+                TrackingEventType.KEYBOARD,
+                TrackingEventType.MOUSE,
+                TrackingEventType.SCREEN_UNLOCK,
+              ],
+            },
+          },
+          orderBy: { createdAt: "asc" },
+        },
+      },
+      orderBy: { loginAt: "desc" },
+      take: limit,
+    });
+
+    const rows = [];
+
+    for (const session of sessions) {
+      const endTime = session.logoutAt || new Date();
+      const idleSecondsFromEvents = secondsFromEventPairs(
+        session.events,
+        TrackingEventType.IDLE_START,
+        TrackingEventType.IDLE_END,
+        endTime,
+      );
+      const trailingIdleSeconds = session.status === SessionStatus.COMPLETED
+        ? trailingIdleSecondsAfterLastActivity(session.events, session.loginAt, endTime)
+        : 0;
+      const breakSecondsFromEvents = secondsFromEventPairs(
+        session.events,
+        TrackingEventType.BREAK_START,
+        TrackingEventType.BREAK_END,
+        endTime,
+      );
+      const idleMinutes = Math.max(
+        session.status === SessionStatus.ACTIVE
+          ? await idleMinutesWithOpenIdle(session.id, session.idleMinutes, endTime)
+          : session.idleMinutes,
+        Math.round((idleSecondsFromEvents + trailingIdleSeconds) / 60),
+      );
+      const breakMinutes = Math.max(
+        session.breakMinutes,
+        Math.round(breakSecondsFromEvents / 60),
+      );
+      const usageByKey = new Map<string, {
+        appName: string;
+        windowTitle: string;
+        category: string;
+        durationSeconds: number;
+        firstSeenAt: Date;
+        lastSeenAt: Date;
+      }>();
+
+      for (const event of session.events) {
+        if (event.type !== TrackingEventType.APP_USAGE) {
+          continue;
+        }
+
+        const appName = event.appName || "Unknown app";
+        const windowTitle = event.windowTitle || "Unknown window";
+        const category = appUsageCategory(event);
+        const key = `${appName}\u0000${windowTitle}\u0000${category}`;
+        const existing = usageByKey.get(key);
+        const durationSeconds = event.durationSeconds ?? 0;
+
+        if (existing) {
+          existing.durationSeconds += durationSeconds;
+          existing.lastSeenAt = event.createdAt;
+        } else {
+          usageByKey.set(key, {
+            appName,
+            windowTitle,
+            category,
+            durationSeconds,
+            firstSeenAt: event.createdAt,
+            lastSeenAt: event.createdAt,
+          });
+        }
+      }
+
+      const usageRows = Array.from(usageByKey.values()).filter((item) => item.durationSeconds > 0);
+      const unproductiveAppMinutes = Math.round(
+        usageRows
+          .filter((item) => item.category === "UNPRODUCTIVE")
+          .reduce((sum, item) => sum + item.durationSeconds, 0) / 60,
+      );
+      const networkInterruptionMinutes = Math.round(
+        usageRows
+          .filter((item) => item.category === "NETWORK")
+          .reduce((sum, item) => sum + item.durationSeconds, 0) / 60,
+      );
+      const unproductiveMinutes = idleMinutes + unproductiveAppMinutes;
+      const nonWorkingUsageMinutes = unproductiveAppMinutes + networkInterruptionMinutes;
+      const totalMinutes = minutesBetween(session.loginAt, endTime);
+      const activeMinutes = Math.max(
+        0,
+        totalMinutes - idleMinutes - breakMinutes - nonWorkingUsageMinutes,
+      );
+      const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+      const productiveMinutes = Math.max(
+        0,
+        productiveMinutesWithBreakAllowance(
+          totalMinutes,
+          idleMinutes,
+          breakMinutes,
+          breakAllowanceMinutes,
+        ) - nonWorkingUsageMinutes,
+      );
+      const autoClosedAt = new Date(dayStart(session.loginAt).getTime() + 24 * 60 * 60 * 1000);
+      const sessionLabel =
+        session.status === SessionStatus.ACTIVE
+          ? "Active"
+          : session.logoutAt?.getTime() === autoClosedAt.getTime()
+            ? "Auto Closed"
+            : "Completed";
+      const baseRow = {
+        sessionId: session.id,
+        userId: session.userId,
+        employeeCode: session.user.employeeCode,
+        employeeName: `${session.user.firstName} ${session.user.lastName}`,
+        department: session.user.department?.name || "Unassigned",
+        loginAt: session.loginAt,
+        logoutAt: session.logoutAt,
+        sessionStatus: session.status,
+        sessionLabel,
+        totalMinutes,
+        idleMinutes,
+        breakMinutes,
+        activeMinutes,
+        productiveMinutes,
+        unproductiveMinutes,
+        unproductiveAppMinutes,
+        networkInterruptionMinutes,
+      };
+
+      if (usageRows.length === 0) {
+        rows.push({
+          ...baseRow,
+          appName: "No app or website recorded",
+          windowTitle: "--",
+          category: "UNRECORDED",
+          appDurationSeconds: 0,
+          firstSeenAt: null,
+          lastSeenAt: null,
+        });
+        continue;
+      }
+
+      for (const usage of usageRows.sort((a, b) => b.durationSeconds - a.durationSeconds)) {
+        rows.push({
+          ...baseRow,
+          appName: usage.appName,
+          windowTitle: usage.windowTitle,
+          category: usage.category,
+          appDurationSeconds: usage.durationSeconds,
+          firstSeenAt: usage.firstSeenAt,
+          lastSeenAt: usage.lastSeenAt,
+        });
+      }
+    }
+
+    res.json({ rows });
+  }),
+);
+
+app.get(
   "/api/tracking/live",
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (_req, res) => {
+    await finalizeStaleActiveSessions();
+
     const users = await prisma.user.findMany({
       where: { status: "ACTIVE", role: UserRole.EMPLOYEE },
       include: {
@@ -1458,6 +2055,8 @@ app.get(
   authenticate,
   async (req: any, res) => {
     try {
+      await finalizeStaleActiveSessions();
+
       const today = dayStart();
       const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
       
@@ -1468,13 +2067,20 @@ app.get(
         },
       });
 
-      const [sessionsToday, productivityRecords, breakAllowanceMinutes] = await Promise.all([
+      const [sessionsToday, activeSessions, productivityRecords, breakAllowanceMinutes] = await Promise.all([
         prisma.loginSession.findMany({
           where: {
             loginAt: {
               gte: today,
               lt: tomorrow,
             },
+            user: { role: UserRole.EMPLOYEE },
+          },
+          orderBy: { loginAt: "desc" },
+        }),
+        prisma.loginSession.findMany({
+          where: {
+            status: SessionStatus.ACTIVE,
             user: { role: UserRole.EMPLOYEE },
           },
           orderBy: { loginAt: "desc" },
@@ -1496,46 +2102,74 @@ app.get(
         }
       }
 
+      const activeSessionByUser = new Map<number, (typeof activeSessions)[number]>();
+
+      for (const session of activeSessions) {
+        if (!activeSessionByUser.has(session.userId)) {
+          activeSessionByUser.set(session.userId, session);
+        }
+      }
+
       const loggedInUserIds = new Set(sessionsToday.map((session) => session.userId));
-      const activeEmployees = Array.from(latestSessionByUser.values()).filter(
-        (session) => session.status === SessionStatus.ACTIVE,
+      const activeEmployees = activeSessionByUser.size;
+      const activeSessionIds = activeSessions.map((session) => session.id);
+
+      const activeStateEvents = activeSessionIds.length > 0
+        ? await prisma.trackingEvent.findMany({
+          where: {
+            sessionId: { in: activeSessionIds },
+            type: {
+              in: [
+                TrackingEventType.BREAK_START,
+                TrackingEventType.BREAK_END,
+                TrackingEventType.IDLE_START,
+                TrackingEventType.IDLE_END,
+              ],
+            },
+          },
+          orderBy: { createdAt: "desc" },
+        })
+        : [];
+      const latestBreakEventBySession = new Map<number, (typeof activeStateEvents)[number]>();
+      const latestIdleEventBySession = new Map<number, (typeof activeStateEvents)[number]>();
+
+      for (const event of activeStateEvents) {
+        if (
+          event.sessionId &&
+          (event.type === TrackingEventType.BREAK_START || event.type === TrackingEventType.BREAK_END) &&
+          !latestBreakEventBySession.has(event.sessionId)
+        ) {
+          latestBreakEventBySession.set(event.sessionId, event);
+        }
+
+        if (
+          event.sessionId &&
+          (event.type === TrackingEventType.IDLE_START || event.type === TrackingEventType.IDLE_END) &&
+          !latestIdleEventBySession.has(event.sessionId)
+        ) {
+          latestIdleEventBySession.set(event.sessionId, event);
+        }
+      }
+
+      const breakEmployees = Array.from(latestBreakEventBySession.values()).filter(
+        (event) => event.type === TrackingEventType.BREAK_START,
       ).length;
-
-      // Employees on break today
-      const breakEmployees = await prisma.trackingEvent.count({
-        where: {
-          type: TrackingEventType.BREAK_START,
-          createdAt: {
-            gte: today,
-            lt: new Date(today.getTime() + 24 * 60 * 60 * 1000),
-          },
-          user: { role: UserRole.EMPLOYEE },
-        },
-      });
-
-      // Idle employees today
-      const idleEmployees = await prisma.trackingEvent.count({
-        where: {
-          type: TrackingEventType.IDLE_START,
-          createdAt: {
-            gte: today,
-            lt: new Date(today.getTime() + 24 * 60 * 60 * 1000),
-          },
-          user: { role: UserRole.EMPLOYEE },
-        },
-      });
+      const idleEmployees = Array.from(latestIdleEventBySession.values()).filter(
+        (event) => event.type === TrackingEventType.IDLE_START,
+      ).length;
 
       const productivityByUser = new Map(
         productivityRecords.map((record) => [record.userId, record.productivityPercent]),
       );
-      const productivityValues = Array.from(loggedInUserIds).map((userId) => {
+      const trackedUserIds = new Set([...loggedInUserIds, ...activeSessionByUser.keys()]);
+      const productivityValues = Array.from(trackedUserIds).map((userId) => {
         const storedPercent = productivityByUser.get(userId);
 
         if (typeof storedPercent === "number") {
           return storedPercent;
         }
 
-        const session = latestSessionByUser.get(userId);
+        const session = latestSessionByUser.get(userId) || activeSessionByUser.get(userId);
 
         if (!session) {
           return 0;

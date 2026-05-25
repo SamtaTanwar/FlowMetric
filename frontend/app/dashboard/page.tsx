@@ -42,11 +42,12 @@ import {
 } from "recharts";
 import { useEffect, useMemo, useState } from "react";
 import {
+  allowProtectedNavigation,
   apiRequest,
+  canOpenProtectedRoute,
   clearAuth,
   downloadApiFile,
   getStoredSessionId,
-  getStoredToken,
   getStoredUser,
 } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
@@ -126,6 +127,40 @@ type WorkdayStats = {
   productiveMinutes: number;
   productivity: number;
   isFinalized: boolean;
+};
+
+type AppUsageRow = {
+  appName: string;
+  windowTitle: string;
+  category: string;
+  durationSeconds: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+};
+
+type SessionUsageRow = {
+  sessionId: number;
+  userId: number;
+  employeeCode: string;
+  employeeName: string;
+  department: string;
+  loginAt: string;
+  logoutAt: string | null;
+  sessionStatus: string;
+  sessionLabel: string;
+  totalMinutes: number;
+  idleMinutes: number;
+  breakMinutes: number;
+  activeMinutes: number;
+  productiveMinutes: number;
+  unproductiveMinutes: number;
+  networkInterruptionMinutes: number;
+  appName: string;
+  windowTitle: string;
+  category: string;
+  appDurationSeconds: number;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
 };
 
 type ApiEmployee = {
@@ -273,6 +308,14 @@ function formatMinutes(minutes = 0) {
   return `${hours}h ${remaining}m`;
 }
 
+function formatSeconds(seconds = 0) {
+  if (seconds < 60) {
+    return `${Math.max(0, Math.round(seconds))}s`;
+  }
+
+  return formatMinutes(Math.round(seconds / 60));
+}
+
 function minutesFromLabel(value?: string) {
   if (!value) {
     return 0;
@@ -290,6 +333,19 @@ function formatDateTime(value?: string | null) {
   }
 
   return new Intl.DateTimeFormat("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatFullDateTime(value?: string | null) {
+  if (!value) {
+    return "--";
+  }
+
+  return new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short",
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
@@ -570,6 +626,7 @@ export default function DashboardPage() {
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
   const [employeeRows, setEmployeeRows] = useState<EmployeeRow[]>([]);
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
+  const [sessionUsageRows, setSessionUsageRows] = useState<SessionUsageRow[]>([]);
   const [workflowItems, setWorkflowItems] = useState<WorkflowItem[]>([]);
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
   const [leaveRequests, setLeaveRequests] = useState<ApiLeaveRequest[]>([]);
@@ -587,12 +644,12 @@ export default function DashboardPage() {
   const [departmentChartData, setDepartmentChartData] = useState<Array<{ name: string; value: number; color: string }>>([]);
   const [productivityChartData, setProductivityChartData] = useState<Array<{ day: string; productivity: number; attendance: number; tasks: number }>>([]);
   const [activityChartData, setActivityChartData] = useState<Array<{ hour: string; keyboard: number; mouse: number }>>([]);
-  const [apiStatus, setApiStatus] = useState("Connecting to backend...");
   const [isExporting, setIsExporting] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedEmployee, setSelectedEmployee] = useState<EmployeeRow | null>(null);
 
 const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
+const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
 
   const [isAuthorized, setIsAuthorized] = useState(false);
   const [dashboardStats, setDashboardStats] = useState<{
@@ -621,21 +678,25 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
     const fetchWorkdayStats = async () => {
       if (!selectedEmployee) {
         setWorkdayStats(null);
+        setAppUsageRows([]);
         return;
       }
 
       try {
-        const data = await apiRequest<WorkdayStats>(
-          `/api/employees/${selectedEmployee.id}/workday-stats`,
-        );
+        const [workdayData, appUsageData] = await Promise.all([
+          apiRequest<WorkdayStats>(`/api/employees/${selectedEmployee.id}/workday-stats`),
+          apiRequest<{ usage: AppUsageRow[] }>(`/api/employees/${selectedEmployee.id}/app-usage`),
+        ]);
 
         if (isCurrent) {
-          setWorkdayStats(data);
+          setWorkdayStats(workdayData);
+          setAppUsageRows(appUsageData.usage || []);
         }
       } catch (error) {
         console.error("Workday stats error:", error);
         if (isCurrent) {
           setWorkdayStats(null);
+          setAppUsageRows([]);
         }
       }
     };
@@ -648,15 +709,16 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
   }, [selectedEmployee]);
 
   useEffect(() => {
-    const token = getStoredToken();
     const storedUser = getStoredUser();
 
-    if (!token) {
-      router.replace("/");
+    if (!canOpenProtectedRoute("/dashboard")) {
+      clearAuth();
+      router.replace("/login");
       return;
     }
 
     if (storedUser?.role === "EMPLOYEE") {
+      allowProtectedNavigation("/employee");
       router.replace("/employee");
       return;
     }
@@ -666,6 +728,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
         const meResponse = await apiRequest<{ user: StoredUser }>("/api/auth/me");
 
         if (meResponse.user?.role === "EMPLOYEE") {
+          allowProtectedNavigation("/employee");
           router.replace("/employee");
           return;
         }
@@ -679,6 +742,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
           policiesResponse,
           dashboardStatsResponse,
           reportResponse,
+          sessionUsageResponse,
         ] = await Promise.all([
           apiRequest<{ employees: ApiEmployee[] }>("/api/employees"),
           apiRequest<{ workflows: ApiWorkflow[] }>("/api/workflows"),
@@ -697,6 +761,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
   totalRecorded: number;
 }>("/api/admin/dashboard-stats"),
           apiRequest<ApiDailyReport>("/api/reports/daily"),
+          apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage"),
         ]);
 
         setCurrentUser(meResponse.user || storedUser);
@@ -727,6 +792,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
         setAttendanceRecords(reportResponse.attendance);
         setWorkflowItems(mappedWorkflows);
         setNotificationItems(mappedNotifications);
+        setSessionUsageRows(sessionUsageResponse.rows || []);
         setLeaveRequests(leaveRequestsResponse.requests);
         setLiveEmployees(liveResponse.employees);
 
@@ -811,19 +877,18 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
             date: reportDate,
           },
         ]);
-        setApiStatus(`Backend connected - ${reportResponse.activeSessions} active sessions`);
         setIsAuthorized(true);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Backend connection failed";
 
         if (message.toLowerCase().includes("token") || message.toLowerCase().includes("auth")) {
           clearAuth();
-          router.replace("/");
+          router.replace("/login");
           return;
         }
 
         clearAuth();
-        router.replace("/");
+        router.replace("/login");
       }
     }
 
@@ -903,17 +968,7 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
   }
 
   if (!isAuthorized) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-[#030712] px-5 text-white">
-        <div className="rounded-2xl border border-white/10 bg-white/6 p-6 text-center shadow-2xl shadow-black/30 backdrop-blur-xl">
-          <div className="mx-auto flex size-11 items-center justify-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
-            <ShieldCheck size={22} />
-          </div>
-          <h1 className="mt-4 text-lg font-semibold">Checking admin access</h1>
-          <p className="mt-2 text-sm text-slate-400">Please login before opening the dashboard.</p>
-        </div>
-      </main>
-    );
+    return null;
   }
 
   return (
@@ -1011,7 +1066,6 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
                 <h1 className="text-2xl font-semibold text-white">
                   Employee Workflow Tracking
                 </h1>
-                <p className="mt-1 text-sm text-slate-400">{apiStatus}</p>
               </div>
 
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -1179,6 +1233,8 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
                   <EmployeeTable compact onSelect={selectEmployee} rows={filteredEmployees} selectedName={selectedEmployee?.name} />
                   <ActivityFeed items={activityItems} />
                 </div>
+
+                <SessionUsageTable rows={sessionUsageRows} />
               </>
             )}
 
@@ -1188,12 +1244,15 @@ const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
             {activeTab === "employee" && (
              <EmployeeSelfDashboard
               employee={selectedEmployee}
+              appUsageRows={appUsageRows}
               notifications={notificationItems.filter((item) => item.userId == null || item.userId === selectedEmployee?.id)}
               workdayStats={workdayStats}
             />
             )}
             {activeTab === "attendance" && <AttendanceView records={attendanceRecords} rows={employeeRows} />}
-            {activeTab === "activity" && <ActivityView chartData={activityChartData} rows={employeeRows} />}
+            {activeTab === "activity" && (
+              <ActivityView chartData={activityChartData} rows={employeeRows} sessionUsageRows={sessionUsageRows} />
+            )}
             {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
             {activeTab === "notifications" && (
               <NotificationView
@@ -1318,7 +1377,7 @@ function ActivityFeed({ items = activityFeed }: { items?: ActivityItem[] }) {
   return (
     <SectionCard title="Live Activity Feed">
       <div className="space-y-4">
-        {items.map((item) => {
+        {items.map((item, index) => {
           const Icon =
             item.type === "success"
               ? CheckCircle2
@@ -1335,7 +1394,7 @@ function ActivityFeed({ items = activityFeed }: { items?: ActivityItem[] }) {
                 : "text-rose-200 bg-rose-300/10 ring-1 ring-rose-300/20";
 
           return (
-            <div className="flex gap-3" key={item.title}>
+            <div className="flex gap-3" key={`${item.title}-${item.time}-${item.type}-${index}`}>
               <div className={`flex size-9 shrink-0 items-center justify-center rounded-xl ${glassColor}`}>
                 <Icon size={18} />
               </div>
@@ -1353,10 +1412,12 @@ function ActivityFeed({ items = activityFeed }: { items?: ActivityItem[] }) {
 
 function EmployeeSelfDashboard({
   employee,
+  appUsageRows = [],
   notifications: notificationRows = [],
   workdayStats,
 }: {
   employee?: EmployeeRow | null;
+  appUsageRows?: AppUsageRow[];
   notifications?: NotificationItem[];
   workdayStats?: WorkdayStats | null;
 }) {
@@ -1444,10 +1505,61 @@ const summary = [
         </div>
       </SectionCard>
 
+      <SectionCard title="App & Website Usage">
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-left text-sm">
+            <thead className="text-xs uppercase text-slate-400">
+              <tr className="border-b border-white/10">
+                <th className="px-3 py-3 font-semibold">Activity / App / Website</th>
+                <th className="px-3 py-3 font-semibold">Window</th>
+                <th className="px-3 py-3 font-semibold">Type</th>
+                <th className="px-3 py-3 font-semibold">Time</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/10">
+              {appUsageRows.length > 0 ? (
+                appUsageRows.map((item) => (
+                  <tr key={`${item.appName}-${item.windowTitle}-${item.category}`}>
+                    <td className="max-w-[180px] px-3 py-3 font-medium text-white">
+                      <span className="block truncate">{item.appName}</span>
+                    </td>
+                    <td className="max-w-[260px] px-3 py-3 text-slate-300">
+                      <span className="block truncate">{item.windowTitle}</span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${
+                          item.category === "UNPRODUCTIVE"
+                            ? "bg-rose-300/10 text-rose-200 ring-rose-300/20"
+                            : item.category === "NETWORK"
+                              ? "bg-violet-300/10 text-violet-200 ring-violet-300/20"
+                            : "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20"
+                        }`}
+                      >
+                        {labelFromEnum(item.category)}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 font-semibold text-cyan-100">
+                      {formatSeconds(item.durationSeconds)}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td className="px-3 py-6 text-center text-slate-400" colSpan={4}>
+                    No app or website usage recorded for this session.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
       <SectionCard title="My Notifications">
         <div className="space-y-3">
           {notificationRows.slice(0, 3).map((item) => (
-            <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={item.title}>
+            <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={item.id}>
               <p className="text-xs font-semibold uppercase text-cyan-200">{item.category}</p>
               <p className="mt-2 font-medium text-white">{item.title}</p>
               <p className="mt-1 text-xs text-slate-400">{item.time}</p>
@@ -1541,55 +1653,153 @@ function AttendanceView({
 function ActivityView({
   chartData = [],
   rows = [],
+  sessionUsageRows = [],
 }: {
   chartData?: Array<{ hour: string; keyboard: number; mouse: number }>;
   rows?: EmployeeRow[];
+  sessionUsageRows?: SessionUsageRow[];
 }) {
   const activeSessions = rows.filter((employee) => employee.status === "Active").length;
   const idleMinutes = rows.reduce((sum, employee) => sum + minutesFromLabel(employee.idleTime), 0);
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-      <SectionCard title="Recorded Activity Signals">
-        <p className="mb-4 text-sm text-slate-400">
-          This chart uses each employee&apos;s tracked productive and idle minutes.
-        </p>
-        <div className="h-80">
-          <ResponsiveContainer height="100%" width="100%">
-            <LineChart data={chartData}>
-              <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-              <XAxis dataKey="hour" stroke="#94a3b8" />
-              <YAxis stroke="#94a3b8" />
-              <Tooltip
-                contentStyle={chartTooltipStyle}
-                labelStyle={chartTooltipTextStyle}
-              />
-              <Line dataKey="keyboard" name="Productive Time" stroke="#22d3ee" strokeWidth={3} type="monotone" />
-              <Line dataKey="mouse" name="Idle Time" stroke="#34d399" strokeWidth={3} type="monotone" />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      </SectionCard>
+    <div className="space-y-6">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
+        <SectionCard title="Recorded Activity Signals">
+          <p className="mb-4 text-sm text-slate-400">
+            This chart uses each employee&apos;s tracked productive and idle minutes.
+          </p>
+          <div className="h-80">
+            <ResponsiveContainer height="100%" width="100%">
+              <LineChart data={chartData}>
+                <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
+                <XAxis dataKey="hour" stroke="#94a3b8" />
+                <YAxis stroke="#94a3b8" />
+                <Tooltip
+                  contentStyle={chartTooltipStyle}
+                  labelStyle={chartTooltipTextStyle}
+                />
+                <Line dataKey="keyboard" name="Productive Time" stroke="#22d3ee" strokeWidth={3} type="monotone" />
+                <Line dataKey="mouse" name="Idle Time" stroke="#34d399" strokeWidth={3} type="monotone" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </SectionCard>
 
-      <SectionCard title="Tracking Summary">
-        <div className="grid gap-3">
-          <div className="rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-cyan-100">
-            <KeyboardMetric icon={<Activity size={20} />} label="Active Sessions" value={`${activeSessions}`} />
+        <SectionCard title="Tracking Summary">
+          <div className="grid gap-3">
+            <div className="rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-cyan-100">
+              <KeyboardMetric icon={<Activity size={20} />} label="Active Sessions" value={`${activeSessions}`} />
+            </div>
+            <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-4 text-emerald-100">
+              <KeyboardMetric icon={<MousePointer2 size={20} />} label="Tracked Employees" value={`${rows.length}`} />
+            </div>
+            <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-amber-100">
+              <KeyboardMetric
+                icon={<Clock3 size={20} />}
+                label="Average Idle Time"
+                value={`${Math.round(idleMinutes / Math.max(rows.length, 1))}m`}
+              />
+            </div>
           </div>
-          <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-4 text-emerald-100">
-            <KeyboardMetric icon={<MousePointer2 size={20} />} label="Tracked Employees" value={`${rows.length}`} />
-          </div>
-          <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-amber-100">
-            <KeyboardMetric
-              icon={<Clock3 size={20} />}
-              label="Average Idle Time"
-              value={`${Math.round(idleMinutes / Math.max(rows.length, 1))}m`}
-            />
-          </div>
-        </div>
-      </SectionCard>
+        </SectionCard>
+      </div>
+
+      <SessionUsageTable rows={sessionUsageRows} />
     </div>
   );
+}
+
+function SessionUsageTable({ rows = [] }: { rows?: SessionUsageRow[] }) {
+  return (
+    <SectionCard title="Clock-In to Clock-Out App Usage">
+      <div className="overflow-x-auto">
+        <table className="min-w-[1320px] text-left text-sm">
+          <thead className="text-xs uppercase text-slate-400">
+            <tr className="border-b border-white/10">
+              <th className="px-3 py-3 font-semibold">Employee</th>
+              <th className="px-3 py-3 font-semibold">Clock In</th>
+              <th className="px-3 py-3 font-semibold">Clock Out</th>
+              <th className="px-3 py-3 font-semibold">Status</th>
+              <th className="px-3 py-3 font-semibold">Total Idle</th>
+              <th className="px-3 py-3 font-semibold">Break</th>
+              <th className="px-3 py-3 font-semibold">Productive</th>
+              <th className="px-3 py-3 font-semibold">Unproductive</th>
+              <th className="px-3 py-3 font-semibold">Network</th>
+              <th className="px-3 py-3 font-semibold">Activity / App / Website</th>
+              <th className="px-3 py-3 font-semibold">Window</th>
+              <th className="px-3 py-3 font-semibold">Type</th>
+              <th className="px-3 py-3 font-semibold">Time</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/10">
+            {rows.length > 0 ? (
+              rows.map((item, index) => (
+                <tr key={`${item.sessionId}-${item.appName}-${item.windowTitle}-${item.category}-${index}`}>
+                  <td className="px-3 py-3">
+                    <p className="font-semibold text-white">{item.employeeName}</p>
+                    <p className="mt-0.5 text-xs text-slate-400">{item.employeeCode}</p>
+                  </td>
+                  <td className="px-3 py-3 text-slate-300">{formatFullDateTime(item.loginAt)}</td>
+                  <td className="px-3 py-3 text-slate-300">
+                    {item.logoutAt ? formatFullDateTime(item.logoutAt) : "Still active"}
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(item.sessionLabel)}`}>
+                      {item.sessionLabel}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 font-semibold text-amber-100">{formatMinutes(item.idleMinutes)}</td>
+                  <td className="px-3 py-3 font-semibold text-blue-100">{formatMinutes(item.breakMinutes)}</td>
+                  <td className="px-3 py-3 font-semibold text-emerald-100">{formatMinutes(item.productiveMinutes)}</td>
+                  <td className="px-3 py-3 font-semibold text-rose-100">{formatMinutes(item.unproductiveMinutes)}</td>
+                  <td className="px-3 py-3 font-semibold text-violet-100">{formatMinutes(item.networkInterruptionMinutes)}</td>
+                  <td className="max-w-[190px] px-3 py-3 font-medium text-white">
+                    <span className="block truncate">{item.appName}</span>
+                  </td>
+                  <td className="max-w-[260px] px-3 py-3 text-slate-300">
+                    <span className="block truncate">{item.windowTitle}</span>
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${usageCategoryStyle(item.category)}`}>
+                      {labelFromEnum(item.category)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 font-semibold text-cyan-100">{formatSeconds(item.appDurationSeconds)}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td className="px-3 py-8 text-center text-slate-400" colSpan={13}>
+                  No session usage recorded yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </SectionCard>
+  );
+}
+
+function usageCategoryStyle(category: string) {
+  if (category === "UNPRODUCTIVE") {
+    return "bg-rose-300/10 text-rose-200 ring-rose-300/20";
+  }
+
+  if (category === "NETWORK") {
+    return "bg-violet-300/10 text-violet-200 ring-violet-300/20";
+  }
+
+  if (category === "IDLE" || category === "BREAK") {
+    return "bg-amber-300/10 text-amber-200 ring-amber-300/20";
+  }
+
+  if (category === "PRODUCTIVE") {
+    return "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20";
+  }
+
+  return "bg-slate-300/10 text-slate-300 ring-white/10";
 }
 
 function WorkflowView({

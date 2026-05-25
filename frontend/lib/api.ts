@@ -13,6 +13,7 @@ export type StoredUser = {
 const TOKEN_KEY = "ewtpma_token";
 const USER_KEY = "ewtpma_user";
 const SESSION_KEY = "ewtpma_session_id";
+const LOGIN_SESSION_KEY = "ewtpma_login_session";
 const NAVIGATION_KEY = "ewtpma_allowed_route";
 
 function browserStorage() {
@@ -21,6 +22,14 @@ function browserStorage() {
   }
 
   return window.localStorage;
+}
+
+function browserSessionStorage() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return window.sessionStorage;
 }
 
 export function getStoredToken() {
@@ -51,7 +60,20 @@ export function storeAuth(token: string, user: StoredUser) {
   storage.setItem(TOKEN_KEY, token);
   storage.setItem(USER_KEY, JSON.stringify(user));
   storage.setItem("employeeId", String(user.id));
-  
+  browserSessionStorage()?.setItem(LOGIN_SESSION_KEY, "true");
+}
+
+export function hasActiveLoginSession() {
+  return browserSessionStorage()?.getItem(LOGIN_SESSION_KEY) === "true";
+}
+
+export function isProtectedRouteRefresh() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const navigation = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+  return navigation?.type === "reload";
 }
 
 export function allowProtectedNavigation(path: string) {
@@ -92,6 +114,14 @@ export function consumeProtectedNavigation(path: string) {
   }
 }
 
+export function canOpenProtectedRoute(path: string) {
+  return Boolean(
+    getStoredToken() &&
+      hasActiveLoginSession() &&
+      (consumeProtectedNavigation(path) || isProtectedRouteRefresh()),
+  );
+}
+
 export function clearAuth() {
   const storage = browserStorage();
 
@@ -103,6 +133,7 @@ export function clearAuth() {
   storage.removeItem(USER_KEY);
   storage.removeItem(SESSION_KEY);
   storage.removeItem(NAVIGATION_KEY);
+  browserSessionStorage()?.removeItem(LOGIN_SESSION_KEY);
 }
 
 export function storeSessionId(sessionId: number) {

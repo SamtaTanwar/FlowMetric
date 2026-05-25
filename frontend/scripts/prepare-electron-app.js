@@ -24,6 +24,7 @@ fs.rmSync(appDir, { recursive: true, force: true });
 fs.mkdirSync(appDir, { recursive: true });
 
 fs.copyFileSync(path.join(rootDir, "electron.js"), path.join(appDir, "electron.js"));
+fs.copyFileSync(path.join(rootDir, "preload.js"), path.join(appDir, "preload.js"));
 copyDir(outDir, path.join(appDir, "out"));
 
 const packageJson = {
@@ -46,6 +47,7 @@ const packageJson = {
     },
     files: [
       "electron.js",
+      "preload.js",
       "package.json",
       "out/**/*",
     ],
