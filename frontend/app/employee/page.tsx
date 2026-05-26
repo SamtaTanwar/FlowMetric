@@ -22,6 +22,7 @@ import {
   clearAuth,
   getStoredToken,
   getStoredUser,
+  isEmployeeAccount,
   type StoredUser,
 } from "@/lib/api";
 
@@ -130,7 +131,7 @@ export default function EmployeeDashboard() {
         const response = await apiRequest<{ user: StoredUser }>("/api/auth/me");
         const user = response.user || storedUser;
 
-        if (user?.role !== "EMPLOYEE") {
+        if (!isEmployeeAccount(user)) {
           allowProtectedNavigation("/dashboard");
           router.replace("/dashboard");
           return;
@@ -138,9 +139,24 @@ export default function EmployeeDashboard() {
 
         setCurrentUser(user);
         setIsAuthorized(true);
-      } catch {
-        clearAuth();
-        router.replace("/login");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const lowerMessage = message.toLowerCase();
+
+        if (
+          message.startsWith("401:") ||
+          message.startsWith("403:") ||
+          lowerMessage.includes("token") ||
+          lowerMessage.includes("auth")
+        ) {
+          clearAuth();
+          router.replace("/login");
+          return;
+        }
+
+        console.error("Employee session check failed:", error);
+        setCurrentUser(storedUser);
+        setIsAuthorized(true);
       }
     }
 

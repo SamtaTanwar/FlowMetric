@@ -747,13 +747,23 @@ async function finalizeSession(
     },
   });
 
-  await prisma.trackingEvent.create({
-    data: {
-      userId: session.userId,
+  const existingLogoutEvent = await prisma.trackingEvent.findFirst({
+    where: {
       sessionId: session.id,
       type: TrackingEventType.LOGOUT,
     },
   });
+
+  if (!existingLogoutEvent) {
+    await prisma.trackingEvent.create({
+      data: {
+        userId: session.userId,
+        sessionId: session.id,
+        type: TrackingEventType.LOGOUT,
+        createdAt: logoutAt,
+      },
+    });
+  }
 
   io.emit("session-stopped", {
     session: updatedSession,
@@ -2270,10 +2280,11 @@ app.get("/api/productivity/employee/:id", authenticate, asyncHandler(async (req,
     return;
   }
 
+  const take = req.query.all === "true" ? undefined : 31;
   const records = await prisma.productivityRecord.findMany({
     where: { userId: employeeId },
     orderBy: { date: "desc" },
-    take: 31,
+    ...(take ? { take } : {}),
   });
 
   res.json({ records });
@@ -2291,6 +2302,7 @@ app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
   const canViewAny = adminLikeRoles.includes(user.role);
   const userId = canViewAny ? requestedUserId : user.id;
 
+  const take = req.query.all === "true" ? undefined : 100;
   const records = await prisma.attendanceRecord.findMany({
     where: userId ? { userId } : {},
     include: {
@@ -2304,7 +2316,7 @@ app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
       },
     },
     orderBy: { date: "desc" },
-    take: 100,
+    ...(take ? { take } : {}),
   });
 
   res.json({ records });
@@ -2805,19 +2817,238 @@ app.get(
 );
 
 app.get(
+  "/api/reports/all-time-summary",
+  authenticate,
+  requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
+  asyncHandler(async (_req, res) => {
+    const [
+      firstSession,
+      attendanceCount,
+      sessions,
+      workflowCount,
+      completedWorkflowCount,
+      workflowCounts,
+    ] = await Promise.all([
+      prisma.loginSession.findFirst({
+        where: { user: { role: UserRole.EMPLOYEE } },
+        orderBy: { loginAt: "asc" },
+        select: { loginAt: true },
+      }),
+      prisma.attendanceRecord.count({
+        where: { user: { role: UserRole.EMPLOYEE } },
+      }),
+      prisma.loginSession.findMany({
+        where: { user: { role: UserRole.EMPLOYEE } },
+        select: {
+          loginAt: true,
+          logoutAt: true,
+          activeMinutes: true,
+          idleMinutes: true,
+          breakMinutes: true,
+          productiveMinutes: true,
+        },
+      }),
+      prisma.workflowTask.count(),
+      prisma.workflowTask.count({
+        where: { status: WorkflowStatus.COMPLETED },
+      }),
+      prisma.workflowTask.groupBy({
+        by: ["status"],
+        _count: { status: true },
+      }),
+    ]);
+    const now = new Date();
+    const sessionProductivity = sessions.map((session) => {
+      const loginMinutes = minutesBetween(session.loginAt, session.logoutAt || now);
+      const productiveMinutes = Math.max(
+        session.productiveMinutes,
+        productiveMinutesWithBreakAllowance(loginMinutes, session.idleMinutes, session.breakMinutes),
+      );
+
+      return productivityPercent(productiveMinutes, loginMinutes);
+    });
+    const averageProductivity = sessionProductivity.length
+      ? Math.round(
+          sessionProductivity.reduce((sum, percent) => sum + percent, 0) /
+            sessionProductivity.length,
+        )
+      : 0;
+
+    res.json({
+      firstLoginAt: firstSession?.loginAt ?? null,
+      attendanceRecords: attendanceCount,
+      productivityRecords: sessions.length,
+      averageProductivity,
+      workflows: workflowCount,
+      completedWorkflows: completedWorkflowCount,
+      workflowStatusGroups: workflowCounts.length,
+    });
+  }),
+);
+
+app.get(
+  "/api/reports/employee-summary",
+  authenticate,
+  requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
+  asyncHandler(async (req, res) => {
+    const employeeId = Number(req.query.employeeId);
+
+    if (!employeeId) {
+      res.status(400).json({ message: "employeeId is required" });
+      return;
+    }
+
+    const dateFilterValue = typeof req.query.date === "string" && req.query.date ? req.query.date : "";
+    const monthFilterValue = typeof req.query.month === "string" && req.query.month ? req.query.month : "";
+    const rangeStart = dateFilterValue
+      ? dayStart(dateFilterValue)
+      : monthFilterValue
+        ? new Date(`${monthFilterValue}-01T00:00:00`)
+        : null;
+    const rangeEnd = rangeStart
+      ? dateFilterValue
+        ? new Date(rangeStart.getTime() + 24 * 60 * 60 * 1000)
+        : new Date(rangeStart.getFullYear(), rangeStart.getMonth() + 1, 1)
+      : null;
+    const dateWhere = rangeStart && rangeEnd ? { gte: rangeStart, lt: rangeEnd } : undefined;
+
+    const [employee, sessions, attendance, workflows] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: employeeId },
+        include: { department: true },
+      }),
+      prisma.loginSession.findMany({
+        where: {
+          userId: employeeId,
+          ...(dateWhere ? { loginAt: dateWhere } : {}),
+        },
+        orderBy: { loginAt: "asc" },
+      }),
+      prisma.attendanceRecord.findMany({
+        where: {
+          userId: employeeId,
+          ...(dateWhere ? { date: dateWhere } : {}),
+        },
+        orderBy: { date: "desc" },
+      }),
+      prisma.workflowTask.findMany({
+        where: {
+          assignedToId: employeeId,
+          ...(dateWhere ? { updatedAt: dateWhere } : {}),
+        },
+        orderBy: { updatedAt: "desc" },
+      }),
+    ]);
+
+    if (!employee) {
+      res.status(404).json({ message: "Employee not found" });
+      return;
+    }
+
+    const generatedAt = new Date();
+    const sessionRows = sessions.map((session) => {
+      const endTime = session.logoutAt || generatedAt;
+      const loginMinutes = minutesBetween(session.loginAt, endTime);
+      const productiveMinutes = Math.max(
+        session.productiveMinutes,
+        productiveMinutesWithBreakAllowance(
+          loginMinutes,
+          session.idleMinutes,
+          session.breakMinutes,
+        ),
+      );
+
+      return {
+        loginMinutes,
+        activeMinutes: Math.max(
+          session.activeMinutes,
+          loginMinutes - session.idleMinutes - session.breakMinutes,
+        ),
+        idleMinutes: session.idleMinutes,
+        breakMinutes: session.breakMinutes,
+        productiveMinutes,
+        productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
+      };
+    });
+    const totalLoginMinutes = sessionRows.reduce((sum, record) => sum + record.loginMinutes, 0);
+    const totalActiveMinutes = sessionRows.reduce((sum, record) => sum + record.activeMinutes, 0);
+    const totalProductiveMinutes = sessionRows.reduce((sum, record) => sum + record.productiveMinutes, 0);
+    const totalIdleMinutes = sessionRows.reduce((sum, record) => sum + record.idleMinutes, 0);
+    const totalBreakMinutes = sessionRows.reduce((sum, record) => sum + record.breakMinutes, 0);
+    const averageProductivity = sessionRows.length
+      ? Math.round(sessionRows.reduce((sum, record) => sum + record.productivityPercent, 0) / sessionRows.length)
+      : 0;
+    const completedWorkflows = workflows.filter((workflow) => workflow.status === WorkflowStatus.COMPLETED).length;
+
+    res.json({
+      employee: {
+        id: employee.id,
+        employeeCode: employee.employeeCode,
+        name: `${employee.firstName} ${employee.lastName}`,
+        department: employee.department?.name || "Unassigned",
+      },
+      range: dateFilterValue || monthFilterValue || "all",
+      attendanceDays: attendance.length,
+      presentDays: attendance.filter((record) => record.status === AttendanceStatus.PRESENT).length,
+      lateDays: attendance.filter((record) => record.status === AttendanceStatus.LATE).length,
+      halfDays: attendance.filter((record) => record.status === AttendanceStatus.HALF_DAY).length,
+      totalLoginMinutes,
+      totalActiveMinutes,
+      totalProductiveMinutes,
+      totalIdleMinutes,
+      totalBreakMinutes,
+      averageProductivity,
+      workflowCount: workflows.length,
+      completedWorkflows,
+    });
+  }),
+);
+
+app.get(
   "/api/reports/export",
   authenticate,
   requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
   asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
-    const date = dayStart(req.query.date ? String(req.query.date) : undefined);
-    const tomorrow = new Date(date.getTime() + 24 * 60 * 60 * 1000);
-    const reportDate = date.toISOString().slice(0, 10);
-    const [attendance, productivityEmployees, workflows, workflowCounts, breakAllowanceMinutes] = await Promise.all([
+    const generatedAt = new Date();
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : undefined;
+    const dateFilterValue = typeof req.query.date === "string" && req.query.date ? req.query.date : "";
+    const monthFilterValue = typeof req.query.month === "string" && req.query.month ? req.query.month : "";
+    const rangeStart = dateFilterValue
+      ? dayStart(dateFilterValue)
+      : monthFilterValue
+        ? new Date(`${monthFilterValue}-01T00:00:00`)
+        : null;
+    const rangeEnd = rangeStart
+      ? dateFilterValue
+        ? new Date(rangeStart.getTime() + 24 * 60 * 60 * 1000)
+        : new Date(rangeStart.getFullYear(), rangeStart.getMonth() + 1, 1)
+      : null;
+    const dateWhere = rangeStart && rangeEnd ? { gte: rangeStart, lt: rangeEnd } : undefined;
+    const employeeWhere = {
+      role: UserRole.EMPLOYEE,
+      ...(employeeId ? { id: employeeId } : {}),
+    };
+    const workflowWhere = {
+      ...(employeeId ? { assignedToId: employeeId } : {}),
+      ...(dateWhere ? { updatedAt: dateWhere } : {}),
+    };
+    const [employees, attendance, productivity, workflows, workflowCounts] = await Promise.all([
+      prisma.user.findMany({
+        where: employeeWhere,
+        include: {
+          department: true,
+          loginSessions: {
+            ...(dateWhere ? { where: { loginAt: dateWhere } } : {}),
+            orderBy: { loginAt: "asc" },
+          },
+        },
+        orderBy: [{ firstName: "asc" }, { lastName: "asc" }],
+      }),
       prisma.attendanceRecord.findMany({
         where: {
-          date,
-          user: { role: UserRole.EMPLOYEE },
+          ...(dateWhere ? { date: dateWhere } : {}),
+          user: employeeWhere,
         },
         include: {
           user: {
@@ -2829,110 +3060,232 @@ app.get(
             },
           },
         },
-        orderBy: { user: { firstName: "asc" } },
+        orderBy: [{ userId: "asc" }, { date: "desc" }],
       }),
-      prisma.user.findMany({
-        where: { role: UserRole.EMPLOYEE },
+      prisma.productivityRecord.findMany({
+        where: {
+          ...(dateWhere ? { date: dateWhere } : {}),
+          user: employeeWhere,
+        },
         include: {
-          productivityRecords: {
-            where: { date },
-            orderBy: { date: "desc" },
-            take: 1,
-          },
-          loginSessions: {
-            where: {
-              loginAt: {
-                gte: date,
-                lt: tomorrow,
-              },
+          user: {
+            select: {
+              employeeCode: true,
+              firstName: true,
+              lastName: true,
+              department: true,
             },
-            orderBy: { loginAt: "desc" },
-            take: 1,
           },
         },
-        orderBy: { firstName: "asc" },
+        orderBy: [{ userId: "asc" }, { date: "desc" }],
       }),
       prisma.workflowTask.findMany({
+        where: workflowWhere,
         include: {
           assignedTo: {
             select: { employeeCode: true, firstName: true, lastName: true },
           },
           department: true,
         },
-        orderBy: [{ status: "asc" }, { updatedAt: "desc" }],
+        orderBy: [{ updatedAt: "desc" }],
       }),
       prisma.workflowTask.groupBy({
         by: ["status"],
+        where: workflowWhere,
         _count: { status: true },
       }),
-      getBreakAllowanceMinutes(),
     ]);
 
-    const productivityRows = productivityEmployees.map((employee) => {
-      const record = employee.productivityRecords[0];
+    const productivityByUser = new Map<number, typeof productivity>();
+    const attendanceByUser = new Map<number, typeof attendance>();
+    const workflowsByUser = new Map<number, typeof workflows>();
 
-      if (record) {
-        return {
-          employeeCode: employee.employeeCode,
-          name: `${employee.firstName} ${employee.lastName}`,
-          loginMinutes: record.loginMinutes,
-          activeMinutes: record.activeMinutes,
-          idleMinutes: record.idleMinutes,
-          breakMinutes: record.breakMinutes,
-          productiveMinutes: record.productiveMinutes,
-          productivityPercent: record.productivityPercent,
-        };
-      }
-
-      const session = employee.loginSessions[0];
-      const endTime = session?.logoutAt || new Date();
-      const loginMinutes = session ? minutesBetween(session.loginAt, endTime) : 0;
-      const idleMinutes = session?.idleMinutes ?? 0;
-      const breakMinutes = session?.breakMinutes ?? 0;
-      const productiveMinutes = productiveMinutesWithBreakAllowance(
-        loginMinutes,
-        idleMinutes,
-        breakMinutes,
-        breakAllowanceMinutes,
-      );
-
-      return {
-        employeeCode: employee.employeeCode,
-        name: `${employee.firstName} ${employee.lastName}`,
-        loginMinutes,
-        activeMinutes: Math.max(0, loginMinutes - idleMinutes - breakMinutes),
-        idleMinutes,
-        breakMinutes,
-        productiveMinutes,
-        productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
-      };
+    productivity.forEach((record) => {
+      const rows = productivityByUser.get(record.userId) || [];
+      rows.push(record);
+      productivityByUser.set(record.userId, rows);
     });
 
+    attendance.forEach((record) => {
+      const rows = attendanceByUser.get(record.userId) || [];
+      rows.push(record);
+      attendanceByUser.set(record.userId, rows);
+    });
+
+    workflows.forEach((workflow) => {
+      if (!workflow.assignedToId) {
+        return;
+      }
+
+      const rows = workflowsByUser.get(workflow.assignedToId) || [];
+      rows.push(workflow);
+      workflowsByUser.set(workflow.assignedToId, rows);
+    });
+
+    const sessionProductivityRows = employees.flatMap((employee) =>
+      employee.loginSessions.map((session) => {
+        const endTime = session.logoutAt || generatedAt;
+        const loginMinutes = minutesBetween(session.loginAt, endTime);
+        const activeMinutes = Math.max(
+          session.activeMinutes,
+          loginMinutes - session.idleMinutes - session.breakMinutes,
+        );
+        const productiveMinutes = Math.max(
+          session.productiveMinutes,
+          productiveMinutesWithBreakAllowance(
+            loginMinutes,
+            session.idleMinutes,
+            session.breakMinutes,
+          ),
+        );
+
+        return {
+          employee,
+          date: session.loginAt,
+          loginAt: session.loginAt,
+          logoutAt: session.logoutAt,
+          loginMinutes,
+          activeMinutes,
+          idleMinutes: session.idleMinutes,
+          breakMinutes: session.breakMinutes,
+          productiveMinutes,
+          productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
+        };
+      }),
+    );
+    const sessionProductivityByUser = new Map<number, typeof sessionProductivityRows>();
+
+    sessionProductivityRows.forEach((row) => {
+      const rows = sessionProductivityByUser.get(row.employee.id) || [];
+      rows.push(row);
+      sessionProductivityByUser.set(row.employee.id, rows);
+    });
+
+    const summaryRows = employees.map((employee) => {
+      const employeeProductivity = sessionProductivityByUser.get(employee.id) || [];
+      const employeeAttendance = attendanceByUser.get(employee.id) || [];
+      const employeeWorkflows = workflowsByUser.get(employee.id) || [];
+      const totalLoginMinutes = employeeProductivity.reduce((sum, record) => sum + record.loginMinutes, 0);
+      const totalActiveMinutes = employeeProductivity.reduce((sum, record) => sum + record.activeMinutes, 0);
+      const totalProductiveMinutes = employeeProductivity.reduce((sum, record) => sum + record.productiveMinutes, 0);
+      const totalIdleMinutes = employeeProductivity.reduce((sum, record) => sum + record.idleMinutes, 0);
+      const totalBreakMinutes = employeeProductivity.reduce((sum, record) => sum + record.breakMinutes, 0);
+      const averageProductivity = employeeProductivity.length
+        ? Math.round(
+            employeeProductivity.reduce((sum, record) => sum + record.productivityPercent, 0) /
+              employeeProductivity.length,
+          )
+        : 0;
+      const completedWorkflows = employeeWorkflows.filter(
+        (workflow) => workflow.status === WorkflowStatus.COMPLETED,
+      ).length;
+
+      return {
+        employee,
+        firstLoginAt: employee.loginSessions[0]?.loginAt ?? null,
+        attendanceDays: employeeAttendance.length,
+        totalLoginMinutes,
+        totalActiveMinutes,
+        totalProductiveMinutes,
+        totalIdleMinutes,
+        totalBreakMinutes,
+        averageProductivity,
+        workflowCount: employeeWorkflows.length,
+        completedWorkflows,
+      };
+    });
+    const selectedEmployee = employeeId ? employees[0] : null;
+    const reportTitle = selectedEmployee
+      ? `${selectedEmployee.firstName} ${selectedEmployee.lastName} Work Report`
+      : "All Employee Work Report";
+    const reportRange = dateFilterValue
+      ? dateFilterValue
+      : monthFilterValue
+        ? monthFilterValue
+        : "First Login To Now";
+    const attachmentPrefix = selectedEmployee
+      ? `${selectedEmployee.employeeCode}-work-report`
+      : "all-employee-work-report";
+
     const csv = [
-      csvRow(["Daily Report", reportDate]),
+      csvRow([reportTitle]),
+      csvRow(["Report Range", reportRange]),
       csvRow(["Generated For", user ? `${user.firstName} ${user.lastName}` : ""]),
       csvRow(["Employee Code", user?.employeeCode || ""]),
       csvRow(["Role", user?.role || ""]),
       csvRow(["Email", user?.email || ""]),
+      csvRow(["Generated At", generatedAt.toISOString()]),
       "",
-      csvRow(["Attendance"]),
-      csvRow(["Employee Code", "Name", "Department", "Status", "Login At", "Logout At", "Late Minutes"]),
+      csvRow(["Employee Summary - First Login To Now"]),
+      csvRow([
+        "Employee Code",
+        "Name",
+        "Department",
+        "First Login",
+        "Attendance Days",
+        "Total Worked Minutes",
+        "Active Minutes",
+        "Productive Minutes",
+        "Idle Minutes",
+        "Break Minutes",
+        "Average Productivity Percent",
+        "Completed Workflows",
+        "Total Workflows",
+      ]),
+      ...summaryRows.map((row) =>
+        csvRow([
+          row.employee.employeeCode,
+          `${row.employee.firstName} ${row.employee.lastName}`,
+          row.employee.department?.name || "Unassigned",
+          row.firstLoginAt ? row.firstLoginAt.toISOString() : "",
+          row.attendanceDays,
+          row.totalLoginMinutes,
+          row.totalActiveMinutes,
+          row.totalProductiveMinutes,
+          row.totalIdleMinutes,
+          row.totalBreakMinutes,
+          row.averageProductivity,
+          row.completedWorkflows,
+          row.workflowCount,
+        ]),
+      ),
+      "",
+      csvRow(["Attendance History - All Employees"]),
+      csvRow([
+        "Employee Code",
+        "Name",
+        "Department",
+        "Date",
+        "Status",
+        "Clock In",
+        "Clock Out",
+        "Late Minutes",
+        "Overtime Minutes",
+        "Idle Deduction Minutes",
+      ]),
       ...attendance.map((record) =>
         csvRow([
           record.user.employeeCode,
           `${record.user.firstName} ${record.user.lastName}`,
           record.user.department?.name || "Unassigned",
+          record.date.toISOString().slice(0, 10),
           record.status,
           record.loginAt ? record.loginAt.toISOString() : "",
           record.logoutAt ? record.logoutAt.toISOString() : "",
           record.lateMinutes,
+          record.overtimeMinutes,
+          record.idleDeductionMinutes,
         ]),
       ),
       "",
-      csvRow(["Productivity"]),
+      csvRow(["Productivity History - All Employees"]),
       csvRow([
         "Employee Code",
         "Name",
+        "Department",
+        "Date",
+        "Clock In",
+        "Clock Out",
         "Login Minutes",
         "Active Minutes",
         "Idle Minutes",
@@ -2940,10 +3293,16 @@ app.get(
         "Productive Minutes",
         "Productivity Percent",
       ]),
-      ...productivityRows.map((record) =>
+      ...sessionProductivityRows
+        .sort((a, b) => b.loginAt.getTime() - a.loginAt.getTime())
+        .map((record) =>
         csvRow([
-          record.employeeCode,
-          record.name,
+          record.employee.employeeCode,
+          `${record.employee.firstName} ${record.employee.lastName}`,
+          record.employee.department?.name || "Unassigned",
+          record.date.toISOString().slice(0, 10),
+          record.loginAt.toISOString(),
+          record.logoutAt ? record.logoutAt.toISOString() : "",
           record.loginMinutes,
           record.activeMinutes,
           record.idleMinutes,
@@ -2953,29 +3312,45 @@ app.get(
         ]),
       ),
       "",
-      csvRow(["Workflow Summary"]),
+      csvRow(["Workflow Efficiency Summary - All Employees"]),
       csvRow(["Status", "Count"]),
       ...workflowCounts.map((item) => csvRow([item.status, item._count.status])),
       "",
-      csvRow(["Workflow Details"]),
-      csvRow(["Title", "Assigned To", "Department", "Status", "Estimated Hours", "Actual Hours", "Due Date"]),
+      csvRow(["Workflow Details - All Employees"]),
+      csvRow([
+        "Title",
+        "Assigned Employee Code",
+        "Assigned To",
+        "Department",
+        "Status",
+        "Priority",
+        "Estimated Hours",
+        "Actual Hours",
+        "Due Date",
+        "Completed At",
+        "Last Updated",
+      ]),
       ...workflows.map((workflow) =>
         csvRow([
           workflow.title,
+          workflow.assignedTo?.employeeCode || "",
           workflow.assignedTo
-            ? `${workflow.assignedTo.firstName} ${workflow.assignedTo.lastName} (${workflow.assignedTo.employeeCode})`
+            ? `${workflow.assignedTo.firstName} ${workflow.assignedTo.lastName}`
             : "Unassigned",
           workflow.department?.name || "Unassigned",
           workflow.status,
+          workflow.priority,
           workflow.estimatedHours ?? "",
           workflow.actualHours ?? "",
           workflow.dueDate ? workflow.dueDate.toISOString().slice(0, 10) : "",
+          workflow.completedAt ? workflow.completedAt.toISOString() : "",
+          workflow.updatedAt.toISOString(),
         ]),
       ),
-    ].join("\n");
+    ].join("\r\n");
 
     res.header("Content-Type", "text/csv; charset=utf-8");
-    res.attachment(`daily-report-${reportDate}.csv`);
+    res.attachment(`${attachmentPrefix}-${generatedAt.toISOString().slice(0, 10)}.csv`);
     res.send(csv);
   }),
 );

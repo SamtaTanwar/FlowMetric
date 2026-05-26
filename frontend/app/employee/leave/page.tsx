@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Send } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser } from "@/lib/api";
+import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser, isEmployeeAccount } from "@/lib/api";
 
 export default function LeaveRequestPage() {
   const router = useRouter();
@@ -22,7 +22,7 @@ export default function LeaveRequestPage() {
       return;
     }
 
-    if (user?.role !== "EMPLOYEE") {
+    if (!isEmployeeAccount(user)) {
       allowProtectedNavigation("/dashboard");
       router.replace("/dashboard");
     }

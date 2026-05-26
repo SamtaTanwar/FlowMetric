@@ -6,7 +6,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
-import { allowProtectedNavigation, apiRequest, storeAuth } from "@/lib/api";
+import { allowProtectedNavigation, apiRequest, homeRouteForUser, storeAuth } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
 
 import AnimatedGrid from "../components/AnimatedGrid";
@@ -55,12 +55,7 @@ export default function LoginPage() {
 
       storeAuth(response.token, response.user);
 
-      const destination =
-        response.user.role === "ADMIN" ||
-        response.user.role === "MANAGER" ||
-        response.user.role === "HR"
-          ? "/dashboard"
-          : "/employee";
+      const destination = homeRouteForUser(response.user);
 
       allowProtectedNavigation(destination);
       router.replace(destination);

@@ -1,6 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import {
+  Cell,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+} from "recharts";
 import { allowProtectedNavigation } from "@/lib/api";
 
 export type SessionUsageRow = {
@@ -71,6 +78,19 @@ function formatSeconds(seconds = 0) {
 
   return formatMinutes(Math.round(seconds / 60));
 }
+
+const usageChartColors = [
+  "#22d3ee",
+  "#34d399",
+  "#f59e0b",
+  "#fb7185",
+  "#a78bfa",
+  "#60a5fa",
+  "#f472b6",
+  "#2dd4bf",
+  "#f97316",
+  "#84cc16",
+];
 
 function formatFullDateTime(value?: string | null) {
   if (!value) {
@@ -192,7 +212,7 @@ export function EmployeeSnapshotTable({
   return (
     <TableSection href={href} title="Employee Snapshot">
       <div className="overflow-x-auto">
-        <table className="min-w-[940px] text-left text-sm">
+        <table className="min-w-[860px] text-left text-sm">
           <thead className="text-xs uppercase text-slate-400">
             <tr className="border-b border-white/10">
               <th className="px-3 py-3 font-semibold">Employee</th>
@@ -200,10 +220,9 @@ export function EmployeeSnapshotTable({
               <th className="px-3 py-3 font-semibold">Clock Out</th>
               <th className="px-3 py-3 font-semibold">Status</th>
               <th className="px-3 py-3 font-semibold">Total Idle</th>
-              <th className="px-3 py-3 font-semibold">Break</th>
+              <th className="px-3 py-3 font-semibold">Break Time</th>
               <th className="px-3 py-3 font-semibold">Productive</th>
               <th className="px-3 py-3 font-semibold">Unproductive</th>
-              <th className="px-3 py-3 font-semibold">Network</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/10">
@@ -235,12 +254,11 @@ export function EmployeeSnapshotTable({
                   <td className="px-3 py-3 font-semibold text-blue-100">{formatMinutes(item.breakMinutes)}</td>
                   <td className="px-3 py-3 font-semibold text-emerald-100">{formatMinutes(item.productiveMinutes)}</td>
                   <td className="px-3 py-3 font-semibold text-rose-100">{formatMinutes(item.unproductiveMinutes)}</td>
-                  <td className="px-3 py-3 font-semibold text-violet-100">{formatMinutes(item.networkInterruptionMinutes)}</td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td className="px-3 py-8 text-center text-slate-400" colSpan={9}>
+                <td className="px-3 py-8 text-center text-slate-400" colSpan={8}>
                   No session usage recorded yet.
                 </td>
               </tr>
@@ -262,55 +280,92 @@ export function AppWebsiteActivityTable({
   rows?: SessionUsageRow[];
 }) {
   const actualUsageRows = rows.filter(
-    (item) => item.category !== "UNRECORDED" && item.appDurationSeconds > 0,
+    (item) =>
+      item.appDurationSeconds > 0 &&
+      !["UNRECORDED", "IDLE", "BREAK", "NETWORK"].includes(item.category) &&
+      item.appName.trim().length > 0,
   );
-  const rowsToShow = visibleRows(actualUsageRows, previewLimit);
+  const usageByApp = new Map<string, number>();
+
+  for (const item of actualUsageRows) {
+    const name = item.appName.trim();
+    usageByApp.set(name, (usageByApp.get(name) || 0) + item.appDurationSeconds);
+  }
+
+  const totalSeconds = Array.from(usageByApp.values()).reduce((sum, seconds) => sum + seconds, 0);
+  const chartRows = Array.from(usageByApp.entries())
+    .map(([name, seconds]) => ({
+      name,
+      seconds,
+      percentage: totalSeconds > 0 ? Math.round((seconds / totalSeconds) * 100) : 0,
+    }))
+    .sort((first, second) => second.seconds - first.seconds);
+  const rowsToShow = visibleRows(chartRows, previewLimit);
 
   return (
     <TableSection href={href} title="App/Website Activity">
-      <div className="overflow-x-auto">
-        <table className="min-w-[760px] text-left text-sm">
-          <thead className="text-xs uppercase text-slate-400">
-            <tr className="border-b border-white/10">
-              <th className="px-3 py-3 font-semibold">Employee</th>
-              <th className="px-3 py-3 font-semibold">Activity / App / Website</th>
-              <th className="px-3 py-3 font-semibold">Window</th>
-              <th className="px-3 py-3 font-semibold">Type</th>
-              <th className="px-3 py-3 font-semibold">Time</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/10">
-            {rowsToShow.length > 0 ? (
-              rowsToShow.map((item, index) => (
-                <tr key={`${item.sessionId}-${item.appName}-${item.windowTitle}-${item.category}-${index}`}>
-                  <td className="px-3 py-3">
-                    <p className="font-semibold text-white">{item.employeeName}</p>
-                    <p className="mt-0.5 text-xs text-slate-400">{item.employeeCode}</p>
-                  </td>
-                  <td className="max-w-[190px] px-3 py-3 font-medium text-white">
-                    <span className="block truncate">{item.appName}</span>
-                  </td>
-                  <td className="max-w-[300px] px-3 py-3 text-slate-300">
-                    <span className="block truncate">{item.windowTitle}</span>
-                  </td>
-                  <td className="px-3 py-3">
-                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${usageCategoryStyle(item.category)}`}>
-                      {labelFromEnum(item.category)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 font-semibold text-cyan-100">{formatSeconds(item.appDurationSeconds)}</td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td className="px-3 py-8 text-center text-slate-400" colSpan={5}>
-                  No app or website activity recorded yet.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      {chartRows.length > 0 ? (
+        <div className="grid gap-6 lg:grid-cols-[minmax(260px,0.9fr)_minmax(0,1.1fr)] lg:items-center">
+          <div className="h-80 min-h-72">
+            <ResponsiveContainer height="100%" width="100%">
+              <PieChart>
+                <Pie
+                  data={chartRows}
+                  dataKey="seconds"
+                  innerRadius={58}
+                  nameKey="name"
+                  outerRadius={108}
+                  paddingAngle={3}
+                >
+                  {chartRows.map((entry, index) => (
+                    <Cell
+                      fill={usageChartColors[index % usageChartColors.length]}
+                      key={entry.name}
+                    />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: "#ffffff",
+                    border: "1px solid #cbd5e1",
+                    color: "#020617",
+                  }}
+                  formatter={(value, name, item) => [
+                    `${formatSeconds(Number(value))} (${item.payload.percentage}%)`,
+                    name,
+                  ]}
+                  labelStyle={{ color: "#020617" }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2">
+            {rowsToShow.map((item, index) => (
+              <div
+                className="rounded-xl border border-white/10 bg-white/5 p-3"
+                key={item.name}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="size-2.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: usageChartColors[index % usageChartColors.length] }}
+                    />
+                    <p className="truncate text-sm font-semibold text-white">{item.name}</p>
+                  </div>
+                  <span className="text-sm font-semibold text-cyan-100">{item.percentage}%</span>
+                </div>
+                <p className="mt-2 text-xs font-medium text-slate-400">{formatSeconds(item.seconds)}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-8 text-center text-sm text-slate-400">
+          No app or website activity recorded yet.
+        </div>
+      )}
     </TableSection>
   );
 }
@@ -324,7 +379,6 @@ export function SessionUsageTables({ rows = [] }: { rows?: SessionUsageRow[] }) 
         rows={rows}
       />
       <AppWebsiteActivityTable
-        href="/dashboard/app-website-activity"
         previewLimit={5}
         rows={rows}
       />

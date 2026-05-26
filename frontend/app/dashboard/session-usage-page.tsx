@@ -9,6 +9,7 @@ import {
   canOpenProtectedRoute,
   clearAuth,
   getStoredUser,
+  isEmployeeAccount,
 } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
 import {
@@ -62,7 +63,7 @@ export default function SessionUsagePage({ kind }: { kind: TableKind }) {
         const meResponse = await apiRequest<{ user: StoredUser }>("/api/auth/me");
         const user = meResponse.user || storedUser;
 
-        if (user?.role === "EMPLOYEE") {
+        if (isEmployeeAccount(user)) {
           allowProtectedNavigation("/employee");
           router.replace("/employee");
           return;

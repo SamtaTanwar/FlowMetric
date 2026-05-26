@@ -6,6 +6,7 @@ import {
   BarChart3,
   Bell,
   CalendarCheck,
+  CalendarDays,
   CheckCircle2,
   Clock3,
   Download,
@@ -21,18 +22,16 @@ import {
   ShieldCheck,
   TrendingUp,
   Users,
+  XCircle,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { useRouter } from "next/navigation";
 import {
-  Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
-  Line,
-  LineChart,
+  LabelList,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -49,6 +48,7 @@ import {
   downloadApiFile,
   getStoredSessionId,
   getStoredUser,
+  isEmployeeAccount,
 } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
 import { SessionUsageTables } from "./session-usage-tables";
@@ -61,7 +61,6 @@ const navItems = [
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "workflow", label: "Workflows", icon: ListChecks },
-  { id: "notifications", label: "Notifications", icon: Bell },
   { id: "reports", label: "Reports", icon: FileText },
   { id: "settings", label: "Settings", icon: Settings },
 ];
@@ -82,14 +81,24 @@ type EmployeeRow = {
   activeTime?: string;
   idleTime?: string;
   productiveTime?: string;
+  logoutTime?: string;
+  workedMinutes?: number;
 };
 
 type WorkflowItem = {
+  id: number;
   title: string;
+  employeeCode: string;
   owner: string;
-  progress: number;
+  department: string;
   status: string;
+  priority: string;
+  estimatedHours?: number | null;
+  actualHours?: number | null;
+  assignedToId?: number | null;
   due: string;
+  completedAt: string;
+  updatedAt: string;
 };
 
 type NotificationItem = {
@@ -115,6 +124,7 @@ type PolicyItem = {
 };
 
 const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
+const HALF_DAY_WORK_MINUTES = 4 * 60;
 
 type WorkdayStats = {
   loginTime: string | null;
@@ -134,6 +144,21 @@ type AppUsageRow = {
   lastSeenAt: string;
 };
 
+type EmployeeReportSummary = {
+  attendanceDays: number;
+  presentDays: number;
+  lateDays: number;
+  halfDays: number;
+  totalLoginMinutes: number;
+  totalActiveMinutes: number;
+  totalProductiveMinutes: number;
+  totalIdleMinutes: number;
+  totalBreakMinutes: number;
+  averageProductivity: number;
+  workflowCount: number;
+  completedWorkflows: number;
+};
+
 type ApiEmployee = {
   id: number;
   employeeCode: string;
@@ -148,6 +173,7 @@ type ApiEmployee = {
     idleMinutes: number;
     breakMinutes: number;
     productiveMinutes: number;
+    logoutAt?: string | null;
   }>;
   productivityRecords?: Array<{
     productiveMinutes: number;
@@ -163,12 +189,17 @@ type ApiEmployee = {
 };
 
 type ApiWorkflow = {
+  id: number;
   title: string;
   status: string;
+  priority: string;
   dueDate?: string | null;
+  completedAt?: string | null;
+  updatedAt: string;
   estimatedHours?: number | null;
   actualHours?: number | null;
-  assignedTo?: { firstName: string; lastName: string } | null;
+  assignedTo?: { id: number; employeeCode: string; firstName: string; lastName: string } | null;
+  department?: { name: string } | null;
 };
 
 type ApiNotification = {
@@ -223,6 +254,7 @@ type ApiPolicy = {
 type ApiAttendanceRecord = {
   status: string;
   loginAt?: string | null;
+  logoutAt?: string | null;
   lateMinutes?: number | null;
   user: {
     employeeCode: string;
@@ -257,6 +289,16 @@ type ApiDailyReport = {
   workflowCounts: Array<{ status: string; _count: { status: number } }>;
 };
 
+type ApiAllTimeReportSummary = {
+  firstLoginAt?: string | null;
+  attendanceRecords: number;
+  productivityRecords: number;
+  averageProductivity: number;
+  workflows: number;
+  completedWorkflows: number;
+  workflowStatusGroups: number;
+};
+
 function formatMinutes(minutes = 0) {
   const hours = Math.floor(minutes / 60);
   const remaining = minutes % 60;
@@ -285,6 +327,10 @@ function minutesFromLabel(value?: string) {
   const minutes = value.match(/(\d+)m/)?.[1];
 
   return (hours ? Number(hours) * 60 : 0) + (minutes ? Number(minutes) : 0);
+}
+
+function minutesBetween(start: string | Date, end: string | Date) {
+  return Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 60000));
 }
 
 function formatDateTime(value?: string | null) {
@@ -384,6 +430,7 @@ function mapEmployee(employee: ApiEmployee): EmployeeRow {
     ? productivityPercent(liveProductiveMinutes, liveLoginMinutes)
     : Math.round(productivity?.productivityPercent ?? 0);
   const productiveMinutes = isActiveSession ? liveProductiveMinutes : productivity?.productiveMinutes ?? session?.productiveMinutes ?? 0;
+  const workedMinutes = session?.logoutAt ? minutesBetween(session.loginAt, session.logoutAt) : liveLoginMinutes;
   const workflowCount = employee.assignedWorkflows?.length ?? 0;
 
   return {
@@ -404,6 +451,8 @@ function mapEmployee(employee: ApiEmployee): EmployeeRow {
     focus: formatMinutes(productiveMinutes),
     tasks: `${workflowCount} task${workflowCount === 1 ? "" : "s"}`,
     loginTime: formatDateTime(attendance?.loginAt || session?.loginAt),
+    logoutTime: session?.logoutAt ? formatDateTime(session.logoutAt) : "--",
+    workedMinutes,
     activeTime: formatMinutes(session?.activeMinutes ?? productiveMinutes),
     idleTime: formatMinutes(idleMinutes),
     productiveTime: formatMinutes(productiveMinutes),
@@ -411,25 +460,22 @@ function mapEmployee(employee: ApiEmployee): EmployeeRow {
 }
 
 function mapWorkflow(workflow: ApiWorkflow): WorkflowItem {
-  const progress =
-    workflow.status === "COMPLETED"
-      ? 100
-      : workflow.estimatedHours && workflow.actualHours
-        ? Math.min(100, Math.round((workflow.actualHours / workflow.estimatedHours) * 100))
-        : workflow.status === "IN_PROGRESS"
-          ? 65
-          : workflow.status === "REVIEW"
-            ? 82
-            : 35;
-
   return {
+    id: workflow.id,
     title: workflow.title,
+    employeeCode: workflow.assignedTo?.employeeCode || "",
     owner: workflow.assignedTo
       ? `${workflow.assignedTo.firstName} ${workflow.assignedTo.lastName}`
       : "Unassigned",
-    progress,
+    department: workflow.department?.name || "Unassigned",
     status: labelFromEnum(workflow.status),
+    priority: labelFromEnum(workflow.priority),
+    estimatedHours: workflow.estimatedHours,
+    actualHours: workflow.actualHours,
+    assignedToId: workflow.assignedTo?.id ?? null,
     due: formatDate(workflow.dueDate),
+    completedAt: formatDate(workflow.completedAt),
+    updatedAt: formatDate(workflow.updatedAt),
   };
 }
 
@@ -503,6 +549,55 @@ const chartTooltipStyle = {
 const chartTooltipTextStyle = {
   color: "#020617",
 };
+
+const barChartMargin = { top: 24, right: 24, bottom: 0, left: 12 };
+const barXAxisPadding = { left: 32, right: 32 };
+
+function formatPercentValue(value: unknown) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return `${value}%`;
+  }
+
+  return `${Math.round(numericValue)}%`;
+}
+
+function AttendanceMark({ checked }: { checked: boolean }) {
+  return (
+    <span className="inline-flex w-full justify-center">
+      {checked ? (
+        <CheckCircle2 className="text-emerald-300" size={18} />
+      ) : (
+        <XCircle className="text-rose-300" size={18} />
+      )}
+    </span>
+  );
+}
+
+function AttendanceMarkWithDetail({
+  checked,
+  detail,
+  subDetail,
+  showMark = true,
+}: {
+  checked: boolean;
+  detail?: string;
+  subDetail?: string;
+  showMark?: boolean;
+}) {
+  return (
+    <div className="flex min-w-24 flex-col items-center gap-1 text-center">
+      {showMark && <AttendanceMark checked={checked} />}
+      {checked && detail && (
+        <span className="text-xs font-semibold text-slate-200">{detail}</span>
+      )}
+      {checked && subDetail && (
+        <span className="text-[11px] font-medium text-slate-400">{subDetail}</span>
+      )}
+    </div>
+  );
+}
 
 function KpiCard({
   title,
@@ -658,7 +753,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
       return;
     }
 
-    if (storedUser?.role === "EMPLOYEE") {
+    if (isEmployeeAccount(storedUser)) {
       allowProtectedNavigation("/employee");
       router.replace("/employee");
       return;
@@ -668,7 +763,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
       try {
         const meResponse = await apiRequest<{ user: StoredUser }>("/api/auth/me");
 
-        if (meResponse.user?.role === "EMPLOYEE") {
+        if (isEmployeeAccount(meResponse.user)) {
           allowProtectedNavigation("/employee");
           router.replace("/employee");
           return;
@@ -704,6 +799,17 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           apiRequest<ApiDailyReport>("/api/reports/daily"),
           apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage"),
         ]);
+        const allTimeReportResponse = await apiRequest<ApiAllTimeReportSummary>(
+          "/api/reports/all-time-summary",
+        ).catch(() => ({
+          firstLoginAt: null,
+          attendanceRecords: reportResponse.attendance.length,
+          productivityRecords: reportResponse.productivity.length,
+          averageProductivity: dashboardStatsResponse.avgProductivity,
+          workflows: workflowsResponse.workflows.length,
+          completedWorkflows: workflowsResponse.workflows.filter((workflow) => workflow.status === "COMPLETED").length,
+          workflowStatusGroups: reportResponse.workflowCounts.length,
+        }));
 
         if (!isCurrent) {
           return;
@@ -760,7 +866,9 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           })),
         );
 
-        const reportDate = formatDate(reportResponse.date);
+        const reportDate = allTimeReportResponse.firstLoginAt
+          ? `${formatDate(allTimeReportResponse.firstLoginAt)} to now`
+          : "First login to now";
         setDashboardStats({
           totalEmployees: dashboardStatsResponse.totalEmployees,
           activeEmployees: dashboardStatsResponse.activeEmployees,
@@ -774,36 +882,43 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
 
         setReportCards([
           {
-            title: "Daily Productivity Summary",
-            owner: `Average ${dashboardStatsResponse.avgProductivity}%`,
-            status: reportResponse.productivity.length > 0 ? "Updated" : "Pending",
+            title: "Productivity History",
+            owner: `${allTimeReportResponse.productivityRecords} records - Avg ${allTimeReportResponse.averageProductivity}%`,
+            status: allTimeReportResponse.productivityRecords > 0 ? "Updated" : "Pending",
             date: reportDate,
           },
           {
-            title: "Attendance Exception Report",
-            owner: `${reportResponse.attendance.length} records`,
-            status: reportResponse.attendance.length > 0 ? "Updated" : "Pending",
+            title: "Attendance Record",
+            owner: `${allTimeReportResponse.attendanceRecords} records`,
+            status: allTimeReportResponse.attendanceRecords > 0 ? "Updated" : "Pending",
             date: reportDate,
           },
           {
             title: "Workflow Efficiency Report",
-            owner: `${reportResponse.workflowCounts.length} status groups`,
-            status: reportResponse.workflowCounts.length > 0 ? "Updated" : "Pending",
+            owner: `${allTimeReportResponse.completedWorkflows}/${allTimeReportResponse.workflows} completed - ${allTimeReportResponse.workflowStatusGroups} status groups`,
+            status: allTimeReportResponse.workflows > 0 ? "Updated" : "Pending",
             date: reportDate,
           },
         ]);
         setIsAuthorized(true);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Backend connection failed";
+        const lowerMessage = message.toLowerCase();
 
-        if (message.toLowerCase().includes("token") || message.toLowerCase().includes("auth")) {
+        if (
+          message.startsWith("401:") ||
+          message.startsWith("403:") ||
+          lowerMessage.includes("token") ||
+          lowerMessage.includes("auth")
+        ) {
           clearAuth();
           router.replace("/login");
           return;
         }
 
-        clearAuth();
-        router.replace("/login");
+        console.error("Dashboard data load failed:", error);
+        setCurrentUser(storedUser);
+        setIsAuthorized(true);
       }
     }
 
@@ -833,7 +948,6 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   function selectEmployee(employee: EmployeeRow) {
     setSelectedEmployee(employee);
     setActiveTab("employee");
-    setSearchQuery(employee.name);
   }
 
   function handleSearchSubmit() {
@@ -844,11 +958,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     }
   }
 
-  async function handleExportReport() {
+  async function handleExportReport(path = "/api/reports/export", fileName = "all-employee-work-report.csv") {
     setIsExporting(true);
 
     try {
-      await downloadApiFile("/api/reports/export", "daily-report.csv");
+      await downloadApiFile(path, fileName);
     } finally {
       setIsExporting(false);
     }
@@ -1051,32 +1165,34 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           </header>
 
           <div className="space-y-6 p-4 md:p-8">
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              <KpiCard
-                title="Total Employees"
-                value={`${dashboardStats.totalEmployees}`}
-                change={`${dashboardStats.presentCount} present today`}
-                icon={Users}
-              />
-              <KpiCard
-                title="Active Now"
-                value={`${dashboardStats.activeEmployees}`}
-                change={`${dashboardStats.activeEmployees} active sessions`}
-                icon={Activity}
-              />
-              <KpiCard
-                title="Productivity"
-                value={`${dashboardStats.avgProductivity}%`}
-                change={`${dashboardStats.totalRecorded} productivity records`}
-                icon={BarChart3}
-              />
-              <KpiCard
-                title="Attendance"
-                value={`${dashboardStats.attendancePercent}%`}
-                change={`${dashboardStats.presentCount} present`}
-                icon={CalendarCheck}
-              />
-            </div>
+            {activeTab !== "reports" && (
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <KpiCard
+                  title="Total Employees"
+                  value={`${dashboardStats.totalEmployees}`}
+                  change={`${dashboardStats.presentCount} present today`}
+                  icon={Users}
+                />
+                <KpiCard
+                  title="Active Now"
+                  value={`${dashboardStats.activeEmployees}`}
+                  change={`${dashboardStats.activeEmployees} active sessions`}
+                  icon={Activity}
+                />
+                <KpiCard
+                  title="Productivity"
+                  value={`${dashboardStats.avgProductivity}%`}
+                  change={`${dashboardStats.totalRecorded} productivity records`}
+                  icon={BarChart3}
+                />
+                <KpiCard
+                  title="Attendance"
+                  value={`${dashboardStats.attendancePercent}%`}
+                  change={`${dashboardStats.presentCount} present`}
+                  icon={CalendarCheck}
+                />
+              </div>
+            )}
 
             {activeTab === "overview" && (
               <>
@@ -1084,30 +1200,40 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                   <SectionCard title="Employee Productivity Intelligence">
                     <div className="h-80">
                       <ResponsiveContainer height="100%" width="100%">
-                        <AreaChart data={productivityChartData}>
-                          <defs>
-                            <linearGradient id="productivityFill" x1="0" x2="0" y1="0" y2="1">
-                              <stop offset="5%" stopColor="#22d3ee" stopOpacity={0.28} />
-                              <stop offset="95%" stopColor="#22d3ee" stopOpacity={0} />
-                            </linearGradient>
-                          </defs>
+                        <BarChart data={productivityChartData} margin={barChartMargin}>
                           <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-                          <XAxis dataKey="day" stroke="#94a3b8" />
-                          <YAxis stroke="#94a3b8" />
+                          <XAxis dataKey="day" padding={barXAxisPadding} stroke="#94a3b8" />
+                          <YAxis stroke="#94a3b8" tickFormatter={formatPercentValue} />
                           <Tooltip
                             contentStyle={chartTooltipStyle}
+                            formatter={(value, name) => [formatPercentValue(value), name]}
                             labelStyle={chartTooltipTextStyle}
                           />
-                          <Area
+                          <Bar
                             dataKey="productivity"
-                            fill="url(#productivityFill)"
+                            fill="#22d3ee"
                             name="Productivity"
-                            stroke="#22d3ee"
-                            strokeWidth={3}
-                            type="monotone"
-                          />
-                          <Line dataKey="attendance" name="Attendance" stroke="#34d399" strokeWidth={2} />
-                        </AreaChart>
+                            radius={[6, 6, 0, 0]}
+                          >
+                            <LabelList
+                              className="fill-slate-200 text-xs font-semibold"
+                              formatter={formatPercentValue}
+                              position="top"
+                            />
+                          </Bar>
+                          <Bar
+                            dataKey="attendance"
+                            fill="#34d399"
+                            name="Attendance"
+                            radius={[6, 6, 0, 0]}
+                          >
+                            <LabelList
+                              className="fill-slate-200 text-xs font-semibold"
+                              formatter={formatPercentValue}
+                              position="top"
+                            />
+                          </Bar>
+                        </BarChart>
                       </ResponsiveContainer>
                     </div>
                   </SectionCard>
@@ -1179,7 +1305,15 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               />
             )}
             {activeTab === "reports" && (
-              <ReportsView currentUser={currentUser} exporting={isExporting} items={reportCards} onExport={handleExportReport} />
+              <div className="space-y-6">
+                <ReportsView currentUser={currentUser} exporting={isExporting} items={reportCards} onExport={handleExportReport} />
+                <EmployeeDepartmentReports
+                  employees={employeeRows}
+                  exporting={isExporting}
+                  onExport={handleExportReport}
+                  workflows={workflowItems}
+                />
+              </div>
             )}
             {activeTab === "settings" && (
               <SettingsView
@@ -1206,6 +1340,15 @@ function EmployeeTable({
   rows?: EmployeeRow[];
   selectedName?: string;
 }) {
+  const pageSize = 5;
+  const [visibleCount, setVisibleCount] = useState(pageSize);
+  const visibleRows = rows.slice(0, visibleCount);
+  const hasMoreRows = visibleCount < rows.length;
+
+  useEffect(() => {
+    setVisibleCount(pageSize);
+  }, [rows]);
+
   return (
     <SectionCard title="Employee Directory">
       <p className="mb-4 text-sm text-slate-400">
@@ -1225,7 +1368,7 @@ function EmployeeTable({
             </tr>
           </thead>
           <tbody>
-            {rows.map((employee) => (
+            {visibleRows.map((employee) => (
               <tr
                 className={`cursor-pointer border-b border-white/5 last:border-0 hover:bg-cyan-300/5 ${
                   selectedName === employee.name ? "bg-cyan-300/10" : ""
@@ -1273,7 +1416,7 @@ function EmployeeTable({
                 <td className="py-4 pl-4 font-medium text-slate-200">{employee.tasks}</td>
               </tr>
             ))}
-            {rows.length === 0 && (
+            {visibleRows.length === 0 && (
               <tr>
                 <td className="py-8 text-center text-sm text-slate-400" colSpan={7}>
                   No employee found for this search.
@@ -1283,6 +1426,17 @@ function EmployeeTable({
           </tbody>
         </table>
       </div>
+      {hasMoreRows && (
+        <div className="mt-5 flex justify-center">
+          <button
+            className="rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:bg-cyan-300/15"
+            onClick={() => setVisibleCount((count) => Math.min(count + pageSize, rows.length))}
+            type="button"
+          >
+            See more
+          </button>
+        </div>
+      )}
     </SectionCard>
   );
 }
@@ -1468,59 +1622,113 @@ function AttendanceView({
             : 0,
   }));
 
-  const exceptionRows = rows.filter((employee) => employee.attendance !== "Present");
   const recordByEmployeeCode = new Map(records.map((record) => [record.user.employeeCode, record]));
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
+    <div className="space-y-6">
       <SectionCard title="Team Attendance Overview">
         <p className="mb-4 text-sm text-slate-400">
           This chart uses today&apos;s employee attendance state from the dashboard API.
         </p>
         <div className="h-80">
           <ResponsiveContainer height="100%" width="100%">
-            <BarChart data={attendanceChartData}>
+            <BarChart data={attendanceChartData} margin={barChartMargin}>
               <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-              <XAxis dataKey="day" stroke="#94a3b8" />
-              <YAxis stroke="#94a3b8" />
+              <XAxis dataKey="day" padding={barXAxisPadding} stroke="#94a3b8" />
+              <YAxis stroke="#94a3b8" tickFormatter={formatPercentValue} />
               <Tooltip
                 contentStyle={chartTooltipStyle}
+                formatter={(value, name) => [formatPercentValue(value), name]}
                 labelStyle={chartTooltipTextStyle}
               />
-              <Bar dataKey="attendance" fill="#34d399" name="Attendance %" radius={[6, 6, 0, 0]} />
+              <Bar dataKey="attendance" fill="#34d399" name="Attendance %" radius={[6, 6, 0, 0]}>
+                <LabelList
+                  className="fill-slate-200 text-xs font-semibold"
+                  formatter={formatPercentValue}
+                  position="top"
+                />
+              </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
       </SectionCard>
 
-      <SectionCard title="Attendance Exceptions">
-        <p className="mb-4 text-sm text-slate-400">
-          Employees who are not marked Present today appear here.
-        </p>
-        <div className="space-y-3">
-          {exceptionRows.length > 0 ? (
-            exceptionRows.map((employee) => {
-              const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
+      <SectionCard title="Attendance Status">
+        <div className="overflow-x-auto">
+          <table className="min-w-[900px] w-full text-left text-sm">
+            <thead className="text-xs uppercase text-slate-400">
+              <tr className="border-b border-white/10">
+                <th className="px-4 py-3 font-semibold">Employee</th>
+                <th className="px-4 py-3 font-semibold">Login</th>
+                <th className="px-4 py-3 font-semibold">Logout</th>
+                <th className="px-4 py-3 text-center font-semibold">Late Login</th>
+                <th className="px-4 py-3 text-center font-semibold">Half Day</th>
+                <th className="px-4 py-3 text-center font-semibold">Present</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/10">
+              {rows.length > 0 ? (
+                rows.map((employee) => {
+                  const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
+                  const status = record?.status || employee.attendance.toUpperCase().replace(/\s+/g, "_");
+                  const isLateLogin = status === "LATE" || (record?.lateMinutes ?? 0) > 0 || employee.attendance === "Late";
+                  const loginTime = record?.loginAt ? formatDateTime(record.loginAt) : employee.loginTime || "--";
+                  const logoutTime = record?.logoutAt ? formatDateTime(record.logoutAt) : employee.logoutTime || "--";
+                  const hasLoggedIn = loginTime !== "--" && loginTime !== "Not started";
+                  const hasLoggedOut = logoutTime !== "--" && logoutTime !== "Not started";
+                  const isEarlyHalfDayLogout = hasLoggedOut && (employee.workedMinutes ?? Number.POSITIVE_INFINITY) < HALF_DAY_WORK_MINUTES;
+                  const isHalfDay = status === "HALF_DAY" || employee.attendance === "Half Day" || isLateLogin || isEarlyHalfDayLogout;
+                  const isPresent =
+                    (hasLoggedIn && !hasLoggedOut) ||
+                    ((status === "PRESENT" || employee.attendance === "Present") && !isHalfDay);
+                  const lateMinutes = record?.lateMinutes ?? 0;
+                  const halfDayTime = isEarlyHalfDayLogout && hasLoggedOut ? logoutTime : loginTime;
+                  const halfDayReason = isEarlyHalfDayLogout
+                    ? `Logout after ${formatMinutes(employee.workedMinutes ?? 0)}`
+                    : status === "HALF_DAY"
+                      ? "Half day login"
+                      : isLateLogin
+                        ? "Late login"
+                        : undefined;
 
-              return (
-              <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={`${employee.employeeCode || employee.name}-${employee.attendance}`}>
-                <div className="flex items-center justify-between gap-3">
-                  <p className="font-semibold text-white">{employee.name}</p>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(employee.attendance)}`}>
-                    {employee.attendance}
-                  </span>
-                </div>
-                <p className="mt-1 text-sm text-slate-400">
-                  {record?.user.department?.name || employee.department || "Unassigned"}
-                </p>
-              </div>
-              );
-            })
-          ) : (
-            <div className="rounded-2xl border border-white/10 bg-white/4 p-4 text-center text-sm text-slate-400">
-              All employees are present today.
-            </div>
-          )}
+                  return (
+                    <tr key={`${employee.employeeCode || employee.name}-attendance-status`}>
+                      <td className="px-4 py-3">
+                        <p className="font-semibold text-white">{employee.name}</p>
+                        <p className="mt-0.5 text-xs text-slate-400">
+                          {employee.employeeCode || "No code"} | {record?.user.department?.name || employee.department || "Unassigned"}
+                        </p>
+                      </td>
+                      <td className="px-4 py-3 text-slate-300">{loginTime === "Not started" ? "--" : loginTime}</td>
+                      <td className="px-4 py-3 text-slate-300">{logoutTime === "Not started" ? "--" : logoutTime}</td>
+                      <td className="px-4 py-3">
+                        <AttendanceMarkWithDetail
+                          checked
+                          detail={isLateLogin && loginTime !== "Not started" ? loginTime : "--"}
+                          showMark={false}
+                          subDetail={lateMinutes > 0 ? `${lateMinutes}m late` : undefined}
+                        />
+                      </td>
+                      <td className="px-4 py-3">
+                        <AttendanceMarkWithDetail
+                          checked={isHalfDay}
+                          detail={halfDayTime === "Not started" ? "--" : halfDayTime}
+                          subDetail={halfDayReason}
+                        />
+                      </td>
+                      <td className="px-4 py-3"><AttendanceMark checked={isPresent} /></td>
+                    </tr>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td className="px-4 py-8 text-center text-slate-400" colSpan={6}>
+                    No attendance records available yet.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </SectionCard>
     </div>
@@ -1548,17 +1756,17 @@ function ActivityView({
           </p>
           <div className="h-80">
             <ResponsiveContainer height="100%" width="100%">
-              <LineChart data={chartData}>
+              <BarChart data={chartData} margin={barChartMargin}>
                 <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-                <XAxis dataKey="hour" stroke="#94a3b8" />
+                <XAxis dataKey="hour" padding={barXAxisPadding} stroke="#94a3b8" />
                 <YAxis stroke="#94a3b8" />
                 <Tooltip
                   contentStyle={chartTooltipStyle}
                   labelStyle={chartTooltipTextStyle}
                 />
-                <Line dataKey="keyboard" name="Productive Time" stroke="#22d3ee" strokeWidth={3} type="monotone" />
-                <Line dataKey="mouse" name="Idle Time" stroke="#34d399" strokeWidth={3} type="monotone" />
-              </LineChart>
+                <Bar dataKey="keyboard" fill="#22d3ee" name="Productive Time" radius={[6, 6, 0, 0]} />
+                <Bar dataKey="mouse" fill="#34d399" name="Idle Time" radius={[6, 6, 0, 0]} />
+              </BarChart>
             </ResponsiveContainer>
           </div>
         </SectionCard>
@@ -1606,48 +1814,62 @@ function WorkflowView({
           </p>
         </div>
       )}
-      <div className="grid gap-4 lg:grid-cols-2">
-        {items.length ? items.map((workflow) => (
-          <div className="rounded-2xl border border-white/10 bg-white/4 p-5" key={workflow.title}>
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h3 className="font-semibold text-white">{workflow.title}</h3>
-                <p className="mt-1 text-sm text-slate-400">{workflow.owner}</p>
-              </div>
-              <span
-                className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${
-                  workflow.status === "Blocked"
-                    ? "bg-rose-300/10 text-rose-200 ring-rose-300/20"
-                    : statusStyle(workflow.status === "In Progress" ? "Present" : "Review")
-                }`}
-              >
-                {workflow.status}
-              </span>
-            </div>
-
-            <div className="mt-5">
-              <div className="flex items-center justify-between text-sm">
-                <span className="font-medium text-slate-400">Completion</span>
-                <span className="font-semibold text-white">{workflow.progress}%</span>
-              </div>
-              <div className="mt-2 h-2.5 rounded-full bg-white/10">
-                <div
-                  className="h-2.5 rounded-full bg-linear-to-r from-cyan-300 to-indigo-300"
-                  style={{ width: `${workflow.progress}%` }}
-                />
-              </div>
-            </div>
-
-            <div className="mt-4 flex items-center justify-between text-sm">
-              <span className="text-slate-400">Due</span>
-              <span className="font-semibold text-slate-200">{workflow.due}</span>
-            </div>
-          </div>
-        )) : (
-          <div className="rounded-2xl border border-white/10 bg-white/4 p-5 text-sm text-slate-400 lg:col-span-2">
-            No workflows created or assigned yet for the current view.
-          </div>
-        )}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-240 border-collapse text-left text-sm">
+          <thead>
+            <tr className="border-b border-white/10 text-xs font-semibold uppercase text-slate-400">
+              <th className="py-3 pr-4">Workflow</th>
+              <th className="px-4 py-3">Employee Code</th>
+              <th className="px-4 py-3">Assigned To</th>
+              <th className="px-4 py-3">Department</th>
+              <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">Priority</th>
+              <th className="px-4 py-3">Hours</th>
+              <th className="px-4 py-3">Due Date</th>
+              <th className="px-4 py-3">Completed</th>
+              <th className="py-3 pl-4">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((workflow) => (
+              <tr className="border-b border-white/5 last:border-0 hover:bg-cyan-300/5" key={workflow.id}>
+                <td className="py-4 pr-4 font-semibold text-white">{workflow.title}</td>
+                <td className="px-4 py-4 text-slate-300">{workflow.employeeCode || "--"}</td>
+                <td className="px-4 py-4 text-slate-300">{workflow.owner}</td>
+                <td className="px-4 py-4 text-slate-300">{workflow.department}</td>
+                <td className="px-4 py-4">
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${
+                      workflow.status === "Blocked"
+                        ? "bg-rose-300/10 text-rose-200 ring-rose-300/20"
+                        : workflow.status === "Completed"
+                          ? "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20"
+                          : workflow.status === "In Progress"
+                            ? "bg-cyan-300/10 text-cyan-100 ring-cyan-300/20"
+                            : "bg-amber-300/10 text-amber-200 ring-amber-300/20"
+                    }`}
+                  >
+                    {workflow.status}
+                  </span>
+                </td>
+                <td className="px-4 py-4 text-slate-300">{workflow.priority}</td>
+                <td className="px-4 py-4 text-slate-300">
+                  {workflow.actualHours ?? 0}/{workflow.estimatedHours ?? "--"}
+                </td>
+                <td className="px-4 py-4 text-slate-300">{workflow.due}</td>
+                <td className="px-4 py-4 text-slate-300">{workflow.completedAt}</td>
+                <td className="py-4 pl-4 text-slate-300">{workflow.updatedAt}</td>
+              </tr>
+            ))}
+            {items.length === 0 && (
+              <tr>
+                <td className="py-8 text-center text-sm text-slate-400" colSpan={10}>
+                  No workflows created or assigned yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </SectionCard>
   );
@@ -1816,6 +2038,261 @@ function ReportsView({
         ))}
       </div>
     </SectionCard>
+  );
+}
+
+function EmployeeDepartmentReports({
+  employees = [],
+  exporting,
+  workflows = [],
+  onExport,
+}: {
+  employees?: EmployeeRow[];
+  exporting: boolean;
+  workflows?: WorkflowItem[];
+  onExport: (path?: string, fileName?: string) => void;
+}) {
+  const departments = useMemo(() => {
+    const grouped = new Map<string, EmployeeRow[]>();
+
+    for (const employee of employees) {
+      const department = employee.department || "Unassigned";
+      grouped.set(department, [...(grouped.get(department) || []), employee]);
+    }
+
+    return Array.from(grouped.entries())
+      .map(([name, departmentEmployees]) => ({
+        name,
+        employees: departmentEmployees.sort((first, second) => first.name.localeCompare(second.name)),
+      }))
+      .sort((first, second) => first.name.localeCompare(second.name));
+  }, [employees]);
+  const [selectedDepartment, setSelectedDepartment] = useState("");
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | null>(null);
+  const [reportDate, setReportDate] = useState("");
+  const [isCalendarOpen, setIsCalendarOpen] = useState(false);
+  const [summary, setSummary] = useState<EmployeeReportSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+
+  useEffect(() => {
+    if (!departments.length) {
+      setSelectedDepartment("");
+      setSelectedEmployeeId(null);
+      return;
+    }
+
+    setSelectedDepartment((current) =>
+      current && departments.some((department) => department.name === current)
+        ? current
+        : departments[0].name,
+    );
+  }, [departments]);
+
+  const departmentEmployees =
+    departments.find((department) => department.name === selectedDepartment)?.employees || [];
+
+  useEffect(() => {
+    setSelectedEmployeeId((current) =>
+      current && departmentEmployees.some((employee) => employee.id === current)
+        ? current
+        : departmentEmployees[0]?.id ?? null,
+    );
+  }, [departmentEmployees]);
+
+  const selectedEmployee = departmentEmployees.find((employee) => employee.id === selectedEmployeeId);
+  const selectedWorkflows = selectedEmployee
+    ? workflows.filter((workflow) => workflow.assignedToId === selectedEmployee.id)
+    : [];
+  const completedWorkflows = selectedWorkflows.filter((workflow) => workflow.status === "Completed").length;
+  const summaryQuery = useMemo(() => {
+    if (!selectedEmployee?.id) {
+      return "";
+    }
+
+    const params = new URLSearchParams({ employeeId: String(selectedEmployee.id) });
+
+    if (reportDate) {
+      params.set("date", reportDate);
+    }
+
+    return params.toString();
+  }, [reportDate, selectedEmployee?.id]);
+
+  useEffect(() => {
+    if (!summaryQuery) {
+      setSummary(null);
+      return;
+    }
+
+    let isCurrent = true;
+    setSummaryLoading(true);
+
+    apiRequest<EmployeeReportSummary>(`/api/reports/employee-summary?${summaryQuery}`)
+      .then((response) => {
+        if (isCurrent) {
+          setSummary(response);
+        }
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setSummary(null);
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setSummaryLoading(false);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [summaryQuery]);
+
+  const reportRangeLabel = reportDate ? formatDate(reportDate) : "Login to now";
+  const reportCards = selectedEmployee
+    ? [
+        {
+          title: "Productivity",
+          value: summary ? `${summary.averageProductivity}%` : selectedEmployee.productivityLabel,
+          detail: summary
+            ? `${formatMinutes(summary.totalProductiveMinutes)} productive | ${formatMinutes(summary.totalIdleMinutes)} idle`
+            : `${selectedEmployee.productiveTime || "0m"} productive | ${selectedEmployee.idleTime || "0m"} idle`,
+        },
+        {
+          title: "Attendance",
+          value: summary ? `${summary.attendanceDays} days` : selectedEmployee.attendance,
+          detail: summary
+            ? `${summary.presentDays} present | ${summary.lateDays} late | ${summary.halfDays} half day`
+            : `Login ${selectedEmployee.loginTime || "--"} | Logout ${selectedEmployee.logoutTime || "--"}`,
+        },
+        {
+          title: "Workflow",
+          value: summary ? `${summary.completedWorkflows}/${summary.workflowCount}` : `${completedWorkflows}/${selectedWorkflows.length}`,
+          detail: "completed workflows",
+        },
+      ]
+    : [];
+
+  function exportSelectedEmployeeReport() {
+    if (!selectedEmployee?.id) {
+      return;
+    }
+
+    const params = new URLSearchParams({ employeeId: String(selectedEmployee.id) });
+
+    if (reportDate) {
+      params.set("date", reportDate);
+    }
+
+    onExport(
+      `/api/reports/export?${params.toString()}`,
+      `${selectedEmployee.employeeCode || selectedEmployee.id}-work-report.csv`,
+    );
+  }
+
+  return (
+    <div className="grid gap-6 xl:grid-cols-[260px_320px_minmax(0,1fr)]">
+      <SectionCard title="Departments">
+        <div className="space-y-2">
+          {departments.map((department) => (
+            <button
+              className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm font-semibold transition ${
+                selectedDepartment === department.name
+                  ? "bg-cyan-300/10 text-cyan-100 ring-1 ring-cyan-300/20"
+                  : "bg-white/5 text-slate-300 hover:bg-white/10"
+              }`}
+              key={department.name}
+              onClick={() => setSelectedDepartment(department.name)}
+              type="button"
+            >
+              <span>{department.name}</span>
+              <span className="text-xs text-slate-400">{department.employees.length}</span>
+            </button>
+          ))}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Employees">
+        <div className="space-y-2">
+          {departmentEmployees.map((employee) => (
+            <button
+              className={`w-full rounded-xl px-3 py-3 text-left transition ${
+                selectedEmployeeId === employee.id
+                  ? "bg-emerald-300/10 text-emerald-100 ring-1 ring-emerald-300/20"
+                  : "bg-white/5 text-slate-300 hover:bg-white/10"
+              }`}
+              key={employee.id ?? employee.employeeCode}
+              onClick={() => setSelectedEmployeeId(employee.id ?? null)}
+              type="button"
+            >
+              <p className="font-semibold">{employee.name}</p>
+              <p className="mt-0.5 text-xs text-slate-400">{employee.employeeCode || "No code"}</p>
+            </button>
+          ))}
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        action={
+          <button
+            className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-50 disabled:bg-slate-600 disabled:text-slate-300"
+            disabled={exporting || !selectedEmployee}
+            onClick={exportSelectedEmployeeReport}
+            type="button"
+          >
+            <Download size={16} />
+            {exporting ? "Exporting" : "Export"}
+          </button>
+        }
+        title={selectedEmployee ? `${selectedEmployee.name} Reports` : "Employee Reports"}
+      >
+        <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <p className="text-sm font-semibold text-cyan-100">{reportRangeLabel}</p>
+            <p className="mt-1 text-sm text-slate-400">
+              {summaryLoading ? "Loading selected range..." : "Cards and export follow the selected range."}
+            </p>
+          </div>
+          <div className="relative">
+            <button
+              aria-label="Select report date range"
+              className="flex size-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-cyan-100 hover:bg-white/10"
+              onClick={() => setIsCalendarOpen((open) => !open)}
+              type="button"
+            >
+              <CalendarDays size={18} />
+            </button>
+            {isCalendarOpen && (
+              <div className="absolute right-0 z-20 mt-3 w-64 rounded-2xl border border-white/10 bg-slate-950 p-4 shadow-2xl shadow-black/40">
+                <label className="text-xs font-semibold uppercase text-slate-400">
+                  <span className="flex items-center gap-1"><CalendarDays size={14} /> Date</span>
+                  <input
+                    className="mt-2 h-10 w-full rounded-xl border border-white/10 bg-slate-900 px-3 text-sm text-white"
+                    onChange={(event) => setReportDate(event.target.value)}
+                    type="date"
+                    value={reportDate}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-3">
+          {reportCards.map((report) => (
+            <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={report.title}>
+              <div className="flex size-10 items-center justify-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
+                <FileText size={20} />
+              </div>
+              <h3 className="mt-4 font-semibold text-white">{report.title}</h3>
+              <p className="mt-3 text-2xl font-semibold text-white">{report.value}</p>
+              <p className="mt-2 text-sm text-slate-400">{report.detail}</p>
+            </div>
+          ))}
+        </div>
+      </SectionCard>
+    </div>
   );
 }
 

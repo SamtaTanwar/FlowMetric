@@ -8,6 +8,7 @@ export type StoredUser = {
   lastName: string;
   email: string;
   role: string;
+  accountType?: "ADMIN" | "USER";
 };
 
 const TOKEN_KEY = "ewtpma_token";
@@ -15,6 +16,7 @@ const USER_KEY = "ewtpma_user";
 const SESSION_KEY = "ewtpma_session_id";
 const LOGIN_SESSION_KEY = "ewtpma_login_session";
 const NAVIGATION_KEY = "ewtpma_allowed_route";
+const ADMIN_ROLES = ["ADMIN", "MANAGER", "HR"];
 
 function browserStorage() {
   if (typeof window === "undefined") {
@@ -48,6 +50,18 @@ export function getStoredUser(): StoredUser | null {
   } catch {
     return null;
   }
+}
+
+export function isAdminAccount(user?: StoredUser | null): user is StoredUser {
+  return user?.accountType === "ADMIN" || Boolean(user?.role && ADMIN_ROLES.includes(user.role));
+}
+
+export function isEmployeeAccount(user?: StoredUser | null): user is StoredUser {
+  return user?.role === "EMPLOYEE" && user.accountType !== "ADMIN";
+}
+
+export function homeRouteForUser(user?: StoredUser | null) {
+  return isAdminAccount(user) ? "/dashboard" : "/employee";
 }
 
 export function storeAuth(token: string, user: StoredUser) {
@@ -190,7 +204,7 @@ export async function apiRequest<T>(
       typeof payload === "object" && payload && "message" in payload
         ? String(payload.message)
         : "Request failed";
-    throw new Error(message);
+    throw new Error(`${response.status}: ${message}`);
   }
 
   return payload as T;
