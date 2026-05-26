@@ -56,7 +56,13 @@ type EmployeeNotification = {
 declare global {
   interface Window {
     desktopTracker?: {
-      start(config: { apiBaseUrl: string; token: string; sessionId: number }): Promise<{ ok: boolean; status?: DesktopTrackerStatus }>;
+      start(config: {
+        apiBaseUrl: string;
+        token: string;
+        sessionId: number;
+        screenshotIntervalMinutes?: number;
+        idleThresholdMinutes?: number;
+      }): Promise<{ ok: boolean; status?: DesktopTrackerStatus }>;
       stop(): Promise<{ ok: boolean }>;
       status(): Promise<DesktopTrackerStatus>;
       captureNow(): Promise<DesktopTrackerStatus>;
@@ -71,6 +77,7 @@ type DesktopTrackerStatus = {
   lastUsage: { appName: string; windowTitle: string } | null;
   lastError: string;
   lastSentAt: string | null;
+  lastScreenshotAt: string | null;
   lastResponseStatus: number | null;
 };
 
@@ -250,6 +257,8 @@ useEffect(() => {
     apiBaseUrl: API_BASE_URL,
     token: getStoredToken(),
     sessionId,
+    screenshotIntervalMinutes: 10,
+    idleThresholdMinutes: 5,
   })
     .then((result) => {
       setTrackerStatus(result.status ?? null);
@@ -266,6 +275,7 @@ useEffect(() => {
         lastUsage: null,
         lastError: error instanceof Error ? error.message : "Desktop tracker failed to start",
         lastSentAt: null,
+        lastScreenshotAt: null,
         lastResponseStatus: null,
       });
     });

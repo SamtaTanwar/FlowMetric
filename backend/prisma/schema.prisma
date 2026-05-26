@@ -151,6 +151,7 @@ model User {
 
   loginSessions       LoginSession[]
   trackingEvents      TrackingEvent[]
+  screenshots         EmployeeScreenshot[]
   productivityRecords ProductivityRecord[]
   attendanceRecords   AttendanceRecord[]
   notifications       Notification[]
@@ -179,6 +180,7 @@ model LoginSession {
 
   user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   events TrackingEvent[]
+  screenshots EmployeeScreenshot[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -205,6 +207,26 @@ model TrackingEvent {
 
   @@index([userId, occurredAt])
   @@index([sessionId])
+}
+
+model EmployeeScreenshot {
+  id           Int      @id @default(autoincrement())
+  userId       Int
+  sessionId    Int
+  imageDataUrl String
+  capturedAt   DateTime @default(now())
+  isIdle       Boolean  @default(false)
+  appName      String?
+  windowTitle  String?
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session LoginSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, capturedAt])
+  @@index([sessionId])
+  @@index([isIdle])
 }
 
 model ProductivityRecord {

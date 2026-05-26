@@ -7,11 +7,14 @@ import {
   Bell,
   CalendarCheck,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   Clock3,
   Download,
   FileText,
   Gauge,
+  Image,
   LayoutDashboard,
   ListChecks,
   LogOut,
@@ -57,10 +60,11 @@ import type { SessionUsageRow } from "./session-usage-tables";
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users },
-  { id: "employee", label: "Selected Employee", icon: Gauge },
   { id: "attendance", label: "Attendance", icon: CalendarCheck },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "workflow", label: "Workflows", icon: ListChecks },
+  { id: "screenshots", label: "Screenshots", icon: Image },
+  { id: "notifications", label: "Notifications", icon: Bell },
   { id: "reports", label: "Reports", icon: FileText },
   { id: "settings", label: "Settings", icon: Settings },
 ];
@@ -127,11 +131,14 @@ const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
 const HALF_DAY_WORK_MINUTES = 4 * 60;
 
 type WorkdayStats = {
+  date?: string;
+  sessionId?: number | null;
   loginTime: string | null;
   activeMinutes: number;
   idleMinutes: number;
   productiveMinutes: number;
   productivity: number;
+  attendance?: string;
   isFinalized: boolean;
 };
 
@@ -157,6 +164,22 @@ type EmployeeReportSummary = {
   averageProductivity: number;
   workflowCount: number;
   completedWorkflows: number;
+};
+
+type EmployeeScreenshot = {
+  id: number;
+  imageDataUrl: string;
+  capturedAt: string;
+  isIdle: boolean;
+  appName?: string | null;
+  windowTitle?: string | null;
+  user: {
+    id: number;
+    employeeCode: string;
+    firstName: string;
+    lastName: string;
+    department?: { name: string } | null;
+  };
 };
 
 type ApiEmployee = {
@@ -367,6 +390,28 @@ function formatDate(value?: string | null) {
     month: "short",
     year: "numeric",
   }).format(new Date(value));
+}
+
+function formatMonthLabel(value = new Date()) {
+  return new Intl.DateTimeFormat("en-IN", {
+    month: "long",
+    year: "numeric",
+  }).format(value);
+}
+
+function formatDateParam(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+}
+
+function formatMonthParam(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+
+  return `${year}-${month}`;
 }
 
 function labelFromEnum(value?: string) {
@@ -682,6 +727,7 @@ export default function DashboardPage() {
   const [isExporting, setIsExporting] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedEmployee, setSelectedEmployee] = useState<EmployeeRow | null>(null);
+  const [selectedWorkdayDate, setSelectedWorkdayDate] = useState(formatDateParam());
 
 const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
 const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
@@ -718,9 +764,10 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
       }
 
       try {
+        const dateQuery = encodeURIComponent(selectedWorkdayDate);
         const [workdayData, appUsageData] = await Promise.all([
-          apiRequest<WorkdayStats>(`/api/employees/${selectedEmployee.id}/workday-stats`),
-          apiRequest<{ usage: AppUsageRow[] }>(`/api/employees/${selectedEmployee.id}/app-usage`),
+          apiRequest<WorkdayStats>(`/api/employees/${selectedEmployee.id}/workday-stats?date=${dateQuery}`),
+          apiRequest<{ usage: AppUsageRow[] }>(`/api/employees/${selectedEmployee.id}/app-usage?date=${dateQuery}`),
         ]);
 
         if (isCurrent) {
@@ -741,7 +788,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     return () => {
       isCurrent = false;
     };
-  }, [selectedEmployee]);
+  }, [selectedEmployee, selectedWorkdayDate]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -948,6 +995,8 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   function selectEmployee(employee: EmployeeRow) {
     setSelectedEmployee(employee);
     setActiveTab("employee");
+    setSearchQuery(employee.name);
+    setSelectedWorkdayDate(formatDateParam());
   }
 
   function handleSearchSubmit() {
@@ -1165,33 +1214,33 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           </header>
 
           <div className="space-y-6 p-4 md:p-8">
-            {activeTab !== "reports" && (
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                <KpiCard
-                  title="Total Employees"
-                  value={`${dashboardStats.totalEmployees}`}
-                  change={`${dashboardStats.presentCount} present today`}
-                  icon={Users}
-                />
-                <KpiCard
-                  title="Active Now"
-                  value={`${dashboardStats.activeEmployees}`}
-                  change={`${dashboardStats.activeEmployees} active sessions`}
-                  icon={Activity}
-                />
-                <KpiCard
-                  title="Productivity"
-                  value={`${dashboardStats.avgProductivity}%`}
-                  change={`${dashboardStats.totalRecorded} productivity records`}
-                  icon={BarChart3}
-                />
-                <KpiCard
-                  title="Attendance"
-                  value={`${dashboardStats.attendancePercent}%`}
-                  change={`${dashboardStats.presentCount} present`}
-                  icon={CalendarCheck}
-                />
-              </div>
+            {activeTab === "overview" && (
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <KpiCard
+                title="Total Employees"
+                value={`${dashboardStats.totalEmployees}`}
+                change={`${dashboardStats.presentCount} present today`}
+                icon={Users}
+              />
+              <KpiCard
+                title="Active Now"
+                value={`${dashboardStats.activeEmployees}`}
+                change={`${dashboardStats.activeEmployees} active sessions`}
+                icon={Activity}
+              />
+              <KpiCard
+                title="Productivity"
+                value={`${dashboardStats.avgProductivity}%`}
+                change={`${dashboardStats.totalRecorded} productivity records`}
+                icon={BarChart3}
+              />
+              <KpiCard
+                title="Attendance"
+                value={`${dashboardStats.attendancePercent}%`}
+                change={`${dashboardStats.presentCount} present`}
+                icon={CalendarCheck}
+              />
+            </div>
             )}
 
             {activeTab === "overview" && (
@@ -1287,7 +1336,10 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
              <EmployeeSelfDashboard
               employee={selectedEmployee}
               appUsageRows={appUsageRows}
+              leaveRequests={leaveRequests}
               notifications={notificationItems.filter((item) => item.userId == null || item.userId === selectedEmployee?.id)}
+              onSelectDate={setSelectedWorkdayDate}
+              selectedDate={selectedWorkdayDate}
               workdayStats={workdayStats}
             />
             )}
@@ -1296,6 +1348,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               <ActivityView chartData={activityChartData} rows={employeeRows} sessionUsageRows={sessionUsageRows} />
             )}
             {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
+            {activeTab === "screenshots" && <ScreenshotsView rows={employeeRows} />}
             {activeTab === "notifications" && (
               <NotificationView
                 items={notificationItems}
@@ -1444,12 +1497,18 @@ function EmployeeTable({
 function EmployeeSelfDashboard({
   employee,
   appUsageRows = [],
+  leaveRequests = [],
   notifications: notificationRows = [],
+  onSelectDate,
+  selectedDate,
   workdayStats,
 }: {
   employee?: EmployeeRow | null;
   appUsageRows?: AppUsageRow[];
+  leaveRequests?: ApiLeaveRequest[];
   notifications?: NotificationItem[];
+  onSelectDate?: (date: string) => void;
+  selectedDate: string;
   workdayStats?: WorkdayStats | null;
 }) {
   if (!employee) {
@@ -1468,7 +1527,7 @@ const summary = [
 
   {
     label: "Attendance",
-    value: employee.attendance,
+    value: workdayStats?.attendance ? labelFromEnum(workdayStats.attendance) : employee.attendance,
   },
 
   {
@@ -1505,12 +1564,48 @@ const summary = [
     value: formatMinutes(workdayStats?.productiveMinutes ?? 0),
   },
 ];
+const selectedDay = new Date(`${selectedDate}T00:00:00`);
+const today = new Date();
+const monthStart = new Date(selectedDay.getFullYear(), selectedDay.getMonth(), 1);
+const monthEnd = new Date(selectedDay.getFullYear(), selectedDay.getMonth() + 1, 0);
+const firstCalendarDay = monthStart.getDay();
+const monthDays = monthEnd.getDate();
+const calendarCells = [
+  ...Array.from({ length: firstCalendarDay }, (_, index) => ({ key: `blank-${index}`, day: null })),
+  ...Array.from({ length: monthDays }, (_, index) => ({ key: `day-${index + 1}`, day: index + 1 })),
+];
+const currentMonthApprovedLeaves = leaveRequests.filter((request) => {
+  if (request.user.id !== employee.id || request.status !== "APPROVED") {
+    return false;
+  }
+
+  const createdAt = new Date(request.createdAt);
+  return createdAt.getFullYear() === selectedDay.getFullYear() && createdAt.getMonth() === selectedDay.getMonth();
+});
+const paidLeaveDays = currentMonthApprovedLeaves.reduce((total, request) => total + request.paidDays, 0);
+const unpaidLeaveDays = currentMonthApprovedLeaves.reduce((total, request) => total + request.unpaidDays, 0);
+const totalLeaveDays = paidLeaveDays + unpaidLeaveDays;
+const selectedDateLabel = formatDate(selectedDate);
+const selectedMonth = formatMonthParam(selectedDay);
+
+function selectMonth(monthValue: string) {
+  if (!monthValue) {
+    return;
+  }
+
+  onSelectDate?.(`${monthValue}-01`);
+}
+
+function shiftMonth(offset: number) {
+  const nextMonth = new Date(selectedDay.getFullYear(), selectedDay.getMonth() + offset, 1);
+  onSelectDate?.(formatDateParam(nextMonth));
+}
 
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
       <SectionCard title={`${employee.name} - Workday Details`}>
         <p className="mb-4 text-sm text-slate-400">
-          These numbers belong to the employee selected from search or the Employee Directory.
+          Showing workday details for {selectedDateLabel}.
         </p>
         <div className="grid gap-4 md:grid-cols-3">
           {summary.map((item) => (
@@ -1532,6 +1627,102 @@ const summary = [
             <div className="h-3 w-full rounded-full bg-white/10 sm:w-64">
               <div className="h-3 rounded-full bg-linear-to-r from-cyan-300 to-indigo-300" style={{ width: `${productivityValue ?? 0}%` }} />
             </div>
+          </div>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Calendar">
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-white">{formatMonthLabel(selectedDay)}</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                aria-label="Previous month"
+                className="flex size-9 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10"
+                onClick={() => shiftMonth(-1)}
+                type="button"
+              >
+                <ChevronLeft size={17} />
+              </button>
+              <input
+                aria-label="Select month"
+                className="h-9 rounded-xl border border-white/10 bg-white/5 px-2 text-sm text-slate-100 outline-none [color-scheme:dark]"
+                onChange={(event) => selectMonth(event.target.value)}
+                type="month"
+                value={selectedMonth}
+              />
+              <button
+                aria-label="Next month"
+                className="flex size-9 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10"
+                onClick={() => shiftMonth(1)}
+                type="button"
+              >
+                <ChevronRight size={17} />
+              </button>
+              <button
+                aria-label="Today"
+                className="flex size-9 items-center justify-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100 hover:bg-cyan-300/15"
+                onClick={() => onSelectDate?.(formatDateParam())}
+                type="button"
+              >
+                <CalendarCheck size={17} />
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-7 gap-1 text-center text-xs">
+            {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => (
+              <span className="py-1 font-semibold text-slate-500" key={`${day}-${index}`}>
+                {day}
+              </span>
+            ))}
+            {calendarCells.map((cell) => {
+              const cellDate = cell.day
+                ? formatDateParam(new Date(selectedDay.getFullYear(), selectedDay.getMonth(), cell.day))
+                : "";
+              const isToday =
+                cell.day === today.getDate() &&
+                selectedDay.getMonth() === today.getMonth() &&
+                selectedDay.getFullYear() === today.getFullYear();
+              const isSelected = cellDate === selectedDate;
+
+              return (
+                <button
+                  className={`flex aspect-square items-center justify-center rounded-lg text-xs transition ${
+                    isSelected
+                      ? "bg-cyan-300 text-slate-950 font-semibold"
+                      : isToday
+                        ? "bg-cyan-300/15 text-cyan-100 ring-1 ring-cyan-300/25"
+                      : cell.day
+                        ? "bg-white/5 text-slate-300 hover:bg-white/10"
+                        : "bg-transparent"
+                  }`}
+                  disabled={!cell.day}
+                  key={cell.key}
+                  onClick={() => cellDate && onSelectDate?.(cellDate)}
+                  type="button"
+                >
+                  {cell.day}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+            <p className="text-xs font-semibold uppercase text-slate-400">Total Leaves</p>
+            <p className="mt-2 text-2xl font-semibold text-white">{totalLeaveDays}</p>
+          </div>
+          <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-4">
+            <p className="text-xs font-semibold uppercase text-emerald-100">Paid</p>
+            <p className="mt-2 text-2xl font-semibold text-white">{paidLeaveDays}</p>
+          </div>
+          <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4">
+            <p className="text-xs font-semibold uppercase text-rose-100">Nonpaid</p>
+            <p className="mt-2 text-2xl font-semibold text-white">{unpaidLeaveDays}</p>
           </div>
         </div>
       </SectionCard>
@@ -1791,6 +1982,213 @@ function ActivityView({
       </div>
 
       <SessionUsageTables rows={sessionUsageRows} />
+    </div>
+  );
+}
+
+function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
+  const [screenshots, setScreenshots] = useState<EmployeeScreenshot[]>([]);
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState("");
+  const [employeeSearch, setEmployeeSearch] = useState("");
+  const [selectedDate, setSelectedDate] = useState(formatDateParam());
+  const [isLoading, setIsLoading] = useState(false);
+
+  const matchedEmployees = useMemo(() => {
+    const query = employeeSearch.trim().toLowerCase();
+
+    if (!query) {
+      return rows;
+    }
+
+    return rows.filter((employee) =>
+      [employee.name, employee.employeeCode, employee.department, employee.role]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query)),
+    );
+  }, [employeeSearch, rows]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadScreenshots() {
+      setIsLoading(true);
+
+      try {
+        const params = new URLSearchParams({
+          limit: selectedEmployeeId ? "100" : "12",
+        });
+
+        if (selectedEmployeeId) {
+          params.set("userId", selectedEmployeeId);
+          params.set("date", selectedDate);
+        }
+
+        const response = await apiRequest<{ screenshots: EmployeeScreenshot[] }>(`/api/screenshots?${params.toString()}`);
+
+        if (isCurrent) {
+          setScreenshots(response.screenshots);
+        }
+      } catch {
+        if (isCurrent) {
+          setScreenshots([]);
+        }
+      } finally {
+        if (isCurrent) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    loadScreenshots();
+    const interval = window.setInterval(loadScreenshots, 60000);
+
+    return () => {
+      isCurrent = false;
+      window.clearInterval(interval);
+    };
+  }, [selectedDate, selectedEmployeeId]);
+
+  function openEmployee(employee: EmployeeRow) {
+    if (!employee.id) {
+      return;
+    }
+
+    setSelectedEmployeeId(String(employee.id));
+    setEmployeeSearch(employee.name);
+  }
+
+  return (
+    <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
+      <SectionCard title="Screenshot Filters">
+        <div className="space-y-4">
+          <div>
+            <label className="text-xs font-semibold uppercase text-slate-400">Employee</label>
+            <select
+              className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-[#111827] px-3 text-sm text-white outline-none"
+              onChange={(event) => {
+                setSelectedEmployeeId(event.target.value);
+                const employee = rows.find((item) => String(item.id) === event.target.value);
+                setEmployeeSearch(employee?.name || "");
+              }}
+              value={selectedEmployeeId}
+            >
+              <option value="">Recent captures</option>
+              {rows.map((employee) => (
+                <option key={employee.id ?? employee.name} value={employee.id ?? ""}>
+                  {employee.name} {employee.employeeCode ? `(${employee.employeeCode})` : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold uppercase text-slate-400">Search employee</label>
+            <div className="mt-2 flex h-11 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3">
+              <Search size={17} className="text-slate-400" />
+              <input
+                className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
+                onChange={(event) => setEmployeeSearch(event.target.value)}
+                placeholder="Name, ID, department"
+                value={employeeSearch}
+              />
+            </div>
+          </div>
+
+          {employeeSearch && (
+            <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+              {matchedEmployees.slice(0, 8).map((employee) => (
+                <button
+                  className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/10"
+                  key={employee.id ?? employee.name}
+                  onClick={() => openEmployee(employee)}
+                  type="button"
+                >
+                  <span>
+                    <span className="block font-semibold text-white">{employee.name}</span>
+                    <span className="text-xs text-slate-400">{employee.employeeCode || employee.department}</span>
+                  </span>
+                  <span className="text-xs text-cyan-100">Open</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div>
+            <label className="text-xs font-semibold uppercase text-slate-400">Capture date</label>
+            <input
+              className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-white/6 px-3 text-sm text-white outline-none [color-scheme:dark]"
+              disabled={!selectedEmployeeId}
+              onChange={(event) => setSelectedDate(event.target.value || formatDateParam())}
+              type="date"
+              value={selectedDate}
+            />
+          </div>
+
+          <button
+            className="w-full rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-2.5 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
+            onClick={() => {
+              setSelectedEmployeeId("");
+              setEmployeeSearch("");
+              setSelectedDate(formatDateParam());
+            }}
+            type="button"
+          >
+            Show Recent Captures
+          </button>
+        </div>
+      </SectionCard>
+
+      <SectionCard title={selectedEmployeeId ? "Employee Screenshots" : "Recently Captured Screenshots"}>
+        {isLoading ? (
+          <p className="text-sm text-slate-400">Loading screenshots...</p>
+        ) : screenshots.length > 0 ? (
+          <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+            {screenshots.map((item) => {
+              const employeeName = `${item.user.firstName} ${item.user.lastName}`;
+
+              return (
+                <article
+                  className={`overflow-hidden rounded-2xl border bg-white/5 ${
+                    item.isIdle ? "border-rose-400 ring-1 ring-rose-400/50" : "border-white/10"
+                  }`}
+                  key={item.id}
+                >
+                  <img
+                    alt={`${employeeName} screenshot captured ${formatFullDateTime(item.capturedAt)}`}
+                    className="aspect-video w-full bg-slate-950 object-cover"
+                    src={item.imageDataUrl}
+                  />
+                  <div className="space-y-2 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-white">{employeeName}</p>
+                        <p className="text-xs text-slate-400">{item.user.employeeCode}</p>
+                      </div>
+                      {item.isIdle && (
+                        <span className="rounded-full bg-rose-300/10 px-2.5 py-1 text-xs font-semibold text-rose-100 ring-1 ring-rose-300/20">
+                          Idle
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm text-slate-300">{formatFullDateTime(item.capturedAt)}</p>
+                    {(item.appName || item.windowTitle) && (
+                      <p className="line-clamp-2 text-xs text-slate-400">
+                        {item.appName || "Unknown app"}{item.windowTitle ? ` - ${item.windowTitle}` : ""}
+                      </p>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="text-sm text-slate-400">
+            {selectedEmployeeId
+              ? "No screenshots captured for this employee on the selected date."
+              : "No screenshots have been captured yet."}
+          </p>
+        )}
+      </SectionCard>
     </div>
   );
 }

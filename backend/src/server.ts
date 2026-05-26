@@ -1340,6 +1340,10 @@ app.get(
   asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
     const id = Number(req.params.id);
+    const requestedDate = req.query.date ? dayStart(String(req.query.date)) : dayStart();
+    const nextDate = new Date(requestedDate.getTime() + 24 * 60 * 60 * 1000);
+    const today = dayStart();
+    const isToday = requestedDate.getTime() === today.getTime();
 
     if (!user) {
       res.status(401).json({ message: "Authentication required" });
@@ -1353,18 +1357,15 @@ app.get(
 
     await finalizeStaleActiveSessions(id);
 
-    const today = dayStart();
-    const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
-
     const session = await prisma.loginSession.findFirst({
       where: {
         userId: id,
         OR: [
-          { status: SessionStatus.ACTIVE },
+          ...(isToday ? [{ status: SessionStatus.ACTIVE }] : []),
           {
             loginAt: {
-              gte: today,
-              lt: tomorrow,
+              gte: requestedDate,
+              lt: nextDate,
             },
           },
         ],
@@ -1375,11 +1376,14 @@ app.get(
 
     if (!session) {
       res.json({
+        date: requestedDate,
+        sessionId: null,
         loginTime: null,
         activeMinutes: 0,
         idleMinutes: 0,
         productiveMinutes: 0,
         productivity: 0,
+        attendance: "NOT_MARKED",
         isFinalized: false,
       });
 
@@ -1390,7 +1394,16 @@ app.get(
       where: {
         userId_date: {
           userId: id,
-          date: session.status === SessionStatus.ACTIVE ? dayStart(session.loginAt) : today,
+          date: dayStart(session.loginAt),
+        },
+      },
+    });
+
+    const attendanceRecord = await prisma.attendanceRecord.findUnique({
+      where: {
+        userId_date: {
+          userId: id,
+          date: requestedDate,
         },
       },
     });
@@ -1470,11 +1483,14 @@ app.get(
     const productivity = productivityPercent(productiveMinutes, totalMinutes);
 
     res.json({
+      date: requestedDate,
+      sessionId: session.id,
       loginTime: session.loginAt,
       activeMinutes: productivityRecord?.activeMinutes ?? activeMinutes,
       idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
       productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
       productivity: productivityRecord?.productivityPercent ?? productivity,
+      attendance: attendanceRecord?.status ?? "NOT_MARKED",
       isFinalized: session.status === SessionStatus.COMPLETED,
     });
   })
@@ -1533,6 +1549,111 @@ app.post("/api/tracking/event", authenticate, asyncHandler(async (req, res) => {
   io.emit("tracking-event", { event, userId: user.id });
   res.status(201).json({ message: "Tracking event recorded", event });
 }));
+
+app.post("/api/screenshots", authenticate, asyncHandler(async (req, res) => {
+  const user = getAuthUser(req);
+  const { sessionId, imageDataUrl, capturedAt, isIdle = false, appName, windowTitle } = req.body;
+  const parsedSessionId = Number(sessionId);
+
+  if (!user) {
+    res.status(401).json({ message: "Authentication required" });
+    return;
+  }
+
+  if (!isEmployeeAccount(user)) {
+    res.status(403).json({ message: "Only employee accounts can upload screenshots" });
+    return;
+  }
+
+  if (!parsedSessionId || typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
+    res.status(400).json({ message: "Session and screenshot image are required" });
+    return;
+  }
+
+  const session = await prisma.loginSession.findFirst({
+    where: {
+      id: parsedSessionId,
+      userId: user.id,
+      status: SessionStatus.ACTIVE,
+    },
+  });
+
+  if (!session) {
+    res.status(403).json({ message: "Screenshots can be uploaded only during an active clock-in session" });
+    return;
+  }
+
+  const screenshot = await prisma.employeeScreenshot.create({
+    data: {
+      userId: user.id,
+      sessionId: session.id,
+      imageDataUrl,
+      capturedAt: capturedAt ? new Date(capturedAt) : new Date(),
+      isIdle: Boolean(isIdle),
+      appName: appName ? String(appName) : null,
+      windowTitle: windowTitle ? String(windowTitle) : null,
+    },
+    include: {
+      user: {
+        select: {
+          id: true,
+          employeeCode: true,
+          firstName: true,
+          lastName: true,
+          department: true,
+        },
+      },
+    },
+  });
+
+  io.emit("employee-screenshot", {
+    screenshotId: screenshot.id,
+    userId: user.id,
+    capturedAt: screenshot.capturedAt,
+    isIdle: screenshot.isIdle,
+  });
+
+  res.status(201).json({ message: "Screenshot captured", screenshot });
+}));
+
+app.get(
+  "/api/screenshots",
+  authenticate,
+  requireRoles(UserRole.ADMIN, UserRole.MANAGER, UserRole.HR),
+  asyncHandler(async (req, res) => {
+    const userId = req.query.userId ? Number(req.query.userId) : undefined;
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 24));
+    const date = req.query.date ? dayStart(String(req.query.date)) : undefined;
+    const capturedAt = date
+      ? {
+        gte: date,
+        lt: new Date(date.getTime() + 24 * 60 * 60 * 1000),
+      }
+      : undefined;
+
+    const screenshots = await prisma.employeeScreenshot.findMany({
+      where: {
+        ...(userId ? { userId } : {}),
+        ...(capturedAt ? { capturedAt } : {}),
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            employeeCode: true,
+            firstName: true,
+            lastName: true,
+            department: true,
+          },
+        },
+      },
+      orderBy: { capturedAt: "desc" },
+      take: limit,
+    });
+
+    res.json({ screenshots });
+  }),
+);
 
 app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
   const user = getAuthUser(req);
@@ -1742,6 +1863,7 @@ app.get(
     const user = getAuthUser(req);
     const id = Number(req.params.id);
     const requestedSessionId = req.query.sessionId ? Number(req.query.sessionId) : null;
+    const requestedDate = req.query.date ? dayStart(String(req.query.date)) : null;
 
     if (!user) {
       res.status(401).json({ message: "Authentication required" });
@@ -1765,12 +1887,20 @@ app.get(
       : await prisma.loginSession.findFirst({
         where: {
           userId: id,
+          ...(requestedDate
+            ? {
+              loginAt: {
+                gte: requestedDate,
+                lt: new Date(requestedDate.getTime() + 24 * 60 * 60 * 1000),
+              },
+            }
+            : {}),
         },
         orderBy: [{ status: "asc" }, { loginAt: "desc" }],
       });
 
     if (!session) {
-      res.json({ session: null, usage: [] });
+      res.json({ date: requestedDate, session: null, usage: [] });
       return;
     }
 
@@ -1815,6 +1945,7 @@ app.get(
     }
 
     res.json({
+      date: requestedDate ?? dayStart(session.loginAt),
       session,
       usage: Array.from(usageByKey.values())
         .filter((item) => item.durationSeconds > 0)

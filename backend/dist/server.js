@@ -20,6 +20,8 @@ const io = new socket_io_1.Server(httpServer, {
 const prisma = new client_1.PrismaClient();
 const jwtSecret = process.env.JWT_SECRET || "employee_workflow_secret_key";
 const adminLikeRoles = [client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR];
+const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
+const IDLE_THRESHOLD_MINUTES = 5;
 app.use((0, cors_1.default)());
 app.use(express_1.default.json({ limit: "1mb" }));
 io.on("connection", (socket) => {
@@ -31,11 +33,21 @@ const asyncHandler = (handler) => (req, res, next) => {
 function getAuthUser(req) {
     return req.user;
 }
+function userActorId(user) {
+    return user?.accountType === "USER" ? user.id : null;
+}
+function adminActorId(user) {
+    return user?.accountType === "ADMIN" ? user.id : null;
+}
+function isEmployeeAccount(user) {
+    return user?.accountType === "USER" && user.role === client_1.UserRole.EMPLOYEE;
+}
 function generateToken(user) {
     return jsonwebtoken_1.default.sign({
         userId: user.id,
         role: user.role,
         employeeCode: user.employeeCode,
+        accountType: user.accountType,
     }, jwtSecret, { expiresIn: "8h" });
 }
 function sanitizeUser(user) {
@@ -46,6 +58,7 @@ function sanitizeUser(user) {
         lastName: user.lastName,
         email: user.email,
         role: user.role,
+        accountType: user.accountType,
         department: user.department,
         shift: user.shift,
     };
@@ -57,11 +70,24 @@ function dayStart(input) {
 function minutesBetween(start, end) {
     return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
-function shiftStartForDate(date, shiftStart = "09:00") {
-    const [hours = "9", minutes = "0"] = shiftStart.split(":");
+function timeForDate(date, hours, minutes) {
     const result = dayStart(date);
-    result.setHours(Number(hours), Number(minutes), 0, 0);
+    result.setHours(hours, minutes, 0, 0);
     return result;
+}
+function attendanceForLogin(loginAt) {
+    const shiftStart = timeForDate(loginAt, 9, 0);
+    const halfDayThreshold = timeForDate(loginAt, 9, 15);
+    if (loginAt.getTime() >= halfDayThreshold.getTime()) {
+        return {
+            status: client_1.AttendanceStatus.HALF_DAY,
+            lateMinutes: minutesBetween(shiftStart, loginAt),
+        };
+    }
+    return {
+        status: client_1.AttendanceStatus.PRESENT,
+        lateMinutes: 0,
+    };
 }
 function productivityPercent(productiveMinutes, loginMinutes) {
     if (loginMinutes <= 0) {
@@ -69,15 +95,149 @@ function productivityPercent(productiveMinutes, loginMinutes) {
     }
     return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
-async function writeAuditLog(actorId, action, entity, entityId) {
+function productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES) {
+    const excessBreakMinutes = Math.max(0, breakMinutes - breakAllowanceMinutes);
+    return Math.max(0, loginMinutes - idleMinutes - excessBreakMinutes);
+}
+async function getBreakAllowanceMinutes() {
+    const policy = await prisma.workPolicy.findFirst({
+        orderBy: [{ isDefault: "desc" }, { name: "asc" }],
+        select: { breakAllowanceMinutes: true },
+    });
+    return policy?.breakAllowanceMinutes ?? DEFAULT_BREAK_ALLOWANCE_MINUTES;
+}
+function csvCell(value) {
+    const text = value == null ? "" : String(value);
+    return `"${text.replace(/"/g, '""')}"`;
+}
+function csvRow(values) {
+    return values.map(csvCell).join(",");
+}
+function workflowStatusFromProgress(actualHours, estimatedHours) {
+    if (!estimatedHours || estimatedHours <= 0) {
+        return client_1.WorkflowStatus.IN_PROGRESS;
+    }
+    const progress = (actualHours / estimatedHours) * 100;
+    if (progress >= 100) {
+        return client_1.WorkflowStatus.COMPLETED;
+    }
+    if (progress >= 80) {
+        return client_1.WorkflowStatus.REVIEW;
+    }
+    return client_1.WorkflowStatus.IN_PROGRESS;
+}
+async function applyProductiveTimeToWorkflows(userId, productiveMinutes) {
+    if (productiveMinutes <= 0) {
+        return [];
+    }
+    const workflows = await prisma.workflowTask.findMany({
+        where: {
+            assignedToId: userId,
+            status: {
+                in: [client_1.WorkflowStatus.TODO, client_1.WorkflowStatus.IN_PROGRESS, client_1.WorkflowStatus.REVIEW],
+            },
+        },
+        orderBy: [
+            { dueDate: "asc" },
+            { updatedAt: "asc" },
+        ],
+    });
+    if (workflows.length === 0) {
+        return [];
+    }
+    const addedHoursPerWorkflow = productiveMinutes / 60 / workflows.length;
+    const updates = await Promise.all(workflows.map((workflow) => {
+        const nextActualHours = Number(((workflow.actualHours ?? 0) + addedHoursPerWorkflow).toFixed(2));
+        const nextStatus = workflowStatusFromProgress(nextActualHours, workflow.estimatedHours);
+        return prisma.workflowTask.update({
+            where: { id: workflow.id },
+            data: {
+                actualHours: nextActualHours,
+                status: nextStatus,
+                completedAt: nextStatus === client_1.WorkflowStatus.COMPLETED ? new Date() : null,
+            },
+        });
+    }));
+    updates.forEach((workflow) => io.emit("workflow-updated", workflow));
+    return updates;
+}
+function monthRange(date = new Date()) {
+    const start = new Date(date.getFullYear(), date.getMonth(), 1);
+    const end = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+    return { start, end };
+}
+async function calculateLeavePaySplit(userId, type, days) {
+    if (type !== client_1.LeaveType.SICK) {
+        return { paidDays: 0, unpaidDays: days };
+    }
+    const { start, end } = monthRange();
+    const usedPaidSickLeave = await prisma.leaveRequest.aggregate({
+        where: {
+            userId,
+            type: client_1.LeaveType.SICK,
+            status: client_1.LeaveRequestStatus.APPROVED,
+            createdAt: {
+                gte: start,
+                lt: end,
+            },
+        },
+        _sum: {
+            paidDays: true,
+        },
+    });
+    const remainingPaidSickLeave = Math.max(0, 1 - (usedPaidSickLeave._sum.paidDays ?? 0));
+    const paidDays = Math.min(days, remainingPaidSickLeave);
+    return {
+        paidDays,
+        unpaidDays: days - paidDays,
+    };
+}
+function validatePasswordStrength(password) {
+    if (password.length < 8 ||
+        !/[A-Za-z]/.test(password) ||
+        !/\d/.test(password) ||
+        !/[^A-Za-z0-9]/.test(password)) {
+        return "Password must be at least 8 characters and include a letter, number, and symbol";
+    }
+    return null;
+}
+function prismaErrorMessage(error) {
+    if (error instanceof client_1.Prisma.PrismaClientKnownRequestError) {
+        if (error.code === "P2002") {
+            return "A record with this value already exists";
+        }
+        if (error.code === "P2003") {
+            return "This action cannot be completed because related data is missing";
+        }
+        if (error.code === "P2025") {
+            return "The requested record was not found";
+        }
+        if (error.code === "P2021" || error.code === "P2022") {
+            return "Database schema is not synced. Run npx.cmd prisma db push from the backend folder";
+        }
+        return "Database request failed";
+    }
+    if (error instanceof client_1.Prisma.PrismaClientValidationError) {
+        return "Invalid data sent to the database";
+    }
+    if (error instanceof client_1.Prisma.PrismaClientInitializationError) {
+        return "Database connection could not be initialized";
+    }
+    return null;
+}
+async function writeAuditLog(actorId, action, entity, entityId, actorAdminId = null) {
     await prisma.auditLog.create({
         data: {
             actorId,
+            actorAdminId,
             action,
             entity,
             entityId: entityId ?? null,
         },
     });
+}
+async function writeAuthAuditLog(user, action, entity, entityId) {
+    await writeAuditLog(userActorId(user), action, entity, entityId, adminActorId(user));
 }
 const authenticate = asyncHandler(async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -88,6 +248,35 @@ const authenticate = asyncHandler(async (req, res, next) => {
     try {
         const token = authHeader.replace("Bearer ", "");
         const payload = jsonwebtoken_1.default.verify(token, jwtSecret);
+        if (payload.accountType === "ADMIN") {
+            const admin = await prisma.admin.findUnique({
+                where: { id: payload.userId },
+                select: {
+                    id: true,
+                    adminCode: true,
+                    firstName: true,
+                    lastName: true,
+                    email: true,
+                    role: true,
+                    status: true,
+                },
+            });
+            if (!admin || admin.status !== "ACTIVE") {
+                res.status(401).json({ message: "User is inactive or no longer exists" });
+                return;
+            }
+            req.user = {
+                id: admin.id,
+                employeeCode: admin.adminCode,
+                firstName: admin.firstName,
+                lastName: admin.lastName,
+                email: admin.email,
+                role: admin.role,
+                accountType: "ADMIN",
+            };
+            next();
+            return;
+        }
         const user = await prisma.user.findUnique({
             where: { id: payload.userId },
             select: {
@@ -104,7 +293,10 @@ const authenticate = asyncHandler(async (req, res, next) => {
             res.status(401).json({ message: "User is inactive or no longer exists" });
             return;
         }
-        req.user = user;
+        req.user = {
+            ...user,
+            accountType: "USER",
+        };
         next();
     }
     catch {
@@ -121,6 +313,153 @@ function requireRoles(...roles) {
         next();
     };
 }
+const UNPRODUCTIVE_USAGE_KEYWORDS = [
+    "youtube",
+    "netflix",
+    "prime video",
+    "hotstar",
+    "disney+",
+    "spotify",
+    "wynk",
+    "gaana",
+    "jiosaavn",
+    "vlc",
+    "media player",
+    "movie",
+    "music",
+    "song",
+    "game",
+    "gaming",
+    "steam",
+    "epic games",
+    "valorant",
+    "pubg",
+    "free fire",
+    "minecraft",
+    "roblox",
+    "facebook",
+    "instagram",
+    "whatsapp",
+    "telegram",
+    "twitter",
+    "x.com",
+    "reddit",
+];
+function metadataValue(metadata, key) {
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+        return "";
+    }
+    const value = metadata[key];
+    return typeof value === "string" ? value : "";
+}
+function appUsageCategory(input) {
+    const explicitCategory = metadataValue(input.metadata, "category").toLowerCase();
+    if (explicitCategory.includes("network")) {
+        return "NETWORK";
+    }
+    if (explicitCategory.includes("unproductive")) {
+        return "UNPRODUCTIVE";
+    }
+    if (explicitCategory.includes("productive")) {
+        return "PRODUCTIVE";
+    }
+    const text = [
+        input.appName,
+        input.windowTitle,
+        metadataValue(input.metadata, "url"),
+        metadataValue(input.metadata, "domain"),
+    ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    return UNPRODUCTIVE_USAGE_KEYWORDS.some((keyword) => text.includes(keyword))
+        ? "UNPRODUCTIVE"
+        : "PRODUCTIVE";
+}
+async function nonWorkingUsageMinutesForSession(sessionId) {
+    const events = await prisma.trackingEvent.findMany({
+        where: {
+            sessionId,
+            type: client_1.TrackingEventType.APP_USAGE,
+        },
+        select: {
+            appName: true,
+            windowTitle: true,
+            metadata: true,
+            durationSeconds: true,
+        },
+    });
+    const seconds = events.reduce((sum, event) => {
+        const category = appUsageCategory(event);
+        if (category !== "UNPRODUCTIVE" && category !== "NETWORK") {
+            return sum;
+        }
+        return sum + (event.durationSeconds ?? 0);
+    }, 0);
+    return Math.round(seconds / 60);
+}
+async function idleMinutesWithOpenIdle(sessionId, storedIdleMinutes, endAt) {
+    const latestIdleEvent = await prisma.trackingEvent.findFirst({
+        where: {
+            sessionId,
+            type: {
+                in: [client_1.TrackingEventType.IDLE_START, client_1.TrackingEventType.IDLE_END],
+            },
+        },
+        orderBy: { createdAt: "desc" },
+    });
+    if (latestIdleEvent?.type !== client_1.TrackingEventType.IDLE_START) {
+        return storedIdleMinutes;
+    }
+    return storedIdleMinutes + minutesBetween(latestIdleEvent.createdAt, endAt);
+}
+function secondsFromEventPairs(events, startType, endType, endAt) {
+    let startedAt = null;
+    let totalSeconds = 0;
+    for (const event of events) {
+        if (event.type === startType) {
+            startedAt = event.createdAt;
+        }
+        if (event.type === endType && startedAt) {
+            totalSeconds += event.durationSeconds
+                ? Number(event.durationSeconds)
+                : Math.max(0, Math.round((event.createdAt.getTime() - startedAt.getTime()) / 1000));
+            startedAt = null;
+        }
+    }
+    if (startedAt) {
+        totalSeconds += Math.max(0, Math.round((endAt.getTime() - startedAt.getTime()) / 1000));
+    }
+    return totalSeconds;
+}
+function lastWorkActivityAt(events, fallback) {
+    const workActivityTypes = new Set([
+        client_1.TrackingEventType.LOGIN,
+        client_1.TrackingEventType.IDLE_END,
+        client_1.TrackingEventType.BREAK_END,
+        client_1.TrackingEventType.APP_USAGE,
+        client_1.TrackingEventType.KEYBOARD,
+        client_1.TrackingEventType.MOUSE,
+        client_1.TrackingEventType.SCREEN_UNLOCK,
+    ]);
+    const workEvents = events.filter((event) => workActivityTypes.has(event.type));
+    return workEvents.at(-1)?.createdAt ?? fallback;
+}
+function trailingIdleSecondsAfterLastActivity(events, loginAt, endAt) {
+    const latestEvent = events.at(-1);
+    if (latestEvent?.type === client_1.TrackingEventType.IDLE_START) {
+        return 0;
+    }
+    if (latestEvent?.type === client_1.TrackingEventType.BREAK_START) {
+        return 0;
+    }
+    const lastActivityAt = lastWorkActivityAt(events, loginAt);
+    const idleStartedAt = new Date(lastActivityAt.getTime() + IDLE_THRESHOLD_MINUTES * 60 * 1000);
+    if (idleStartedAt.getTime() >= endAt.getTime()) {
+        return 0;
+    }
+    return Math.round((endAt.getTime() - idleStartedAt.getTime()) / 1000);
+}
 async function finalizeSession(sessionId, input = {}) {
     const session = await prisma.loginSession.findUnique({
         where: { id: sessionId },
@@ -129,13 +468,15 @@ async function finalizeSession(sessionId, input = {}) {
     if (!session) {
         throw new Error("Tracking session not found");
     }
-    const logoutAt = new Date();
+    const logoutAt = input.logoutAt ?? new Date();
     const loginMinutes = minutesBetween(session.loginAt, logoutAt);
     const idleMinutes = input.idleMinutes ?? session.idleMinutes;
     const breakMinutes = input.breakMinutes ?? session.breakMinutes;
-    const activeMinutes = input.activeMinutes ?? Math.max(0, loginMinutes - idleMinutes - breakMinutes);
     const lockMinutes = input.lockMinutes ?? session.lockMinutes;
-    const productiveMinutes = Math.max(0, loginMinutes - idleMinutes - breakMinutes);
+    const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+    const nonWorkingUsageMinutes = await nonWorkingUsageMinutesForSession(session.id);
+    const activeMinutes = Math.max(0, (input.activeMinutes ?? loginMinutes - idleMinutes - breakMinutes) - nonWorkingUsageMinutes);
+    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
     const date = dayStart(session.loginAt);
     const updatedSession = await prisma.loginSession.update({
         where: { id: session.id },
@@ -177,6 +518,7 @@ async function finalizeSession(sessionId, input = {}) {
             score: productivityPercent(productiveMinutes, loginMinutes),
         },
     });
+    const updatedWorkflows = await applyProductiveTimeToWorkflows(session.userId, productiveMinutes);
     await prisma.attendanceRecord.updateMany({
         where: {
             userId: session.userId,
@@ -188,15 +530,68 @@ async function finalizeSession(sessionId, input = {}) {
             idleDeductionMinutes: idleMinutes,
         },
     });
-    await prisma.trackingEvent.create({
-        data: {
-            userId: session.userId,
+    const existingLogoutEvent = await prisma.trackingEvent.findFirst({
+        where: {
             sessionId: session.id,
             type: client_1.TrackingEventType.LOGOUT,
         },
     });
-    io.emit("session-stopped", { session: updatedSession, productivity: record });
-    return { session: updatedSession, productivity: record };
+    if (!existingLogoutEvent) {
+        await prisma.trackingEvent.create({
+            data: {
+                userId: session.userId,
+                sessionId: session.id,
+                type: client_1.TrackingEventType.LOGOUT,
+                createdAt: logoutAt,
+            },
+        });
+    }
+    io.emit("session-stopped", {
+        session: updatedSession,
+        productivity: record,
+        workflows: updatedWorkflows,
+    });
+    return { session: updatedSession, productivity: record, workflows: updatedWorkflows };
+}
+async function finalizeStaleActiveSessions(userId) {
+    const today = dayStart();
+    const sessions = await prisma.loginSession.findMany({
+        where: {
+            status: client_1.SessionStatus.ACTIVE,
+            loginAt: { lt: today },
+            ...(userId ? { userId } : {}),
+        },
+        orderBy: { loginAt: "asc" },
+    });
+    for (const session of sessions) {
+        const logoutAt = new Date(dayStart(session.loginAt).getTime() + 24 * 60 * 60 * 1000);
+        const events = await prisma.trackingEvent.findMany({
+            where: {
+                sessionId: session.id,
+                type: {
+                    in: [
+                        client_1.TrackingEventType.LOGIN,
+                        client_1.TrackingEventType.IDLE_START,
+                        client_1.TrackingEventType.IDLE_END,
+                        client_1.TrackingEventType.BREAK_START,
+                        client_1.TrackingEventType.BREAK_END,
+                        client_1.TrackingEventType.APP_USAGE,
+                        client_1.TrackingEventType.KEYBOARD,
+                        client_1.TrackingEventType.MOUSE,
+                        client_1.TrackingEventType.SCREEN_UNLOCK,
+                    ],
+                },
+            },
+            orderBy: { createdAt: "asc" },
+        });
+        const idleSecondsFromEvents = secondsFromEventPairs(events, client_1.TrackingEventType.IDLE_START, client_1.TrackingEventType.IDLE_END, logoutAt);
+        const trailingIdleSeconds = trailingIdleSecondsAfterLastActivity(events, session.loginAt, logoutAt);
+        const idleMinutes = Math.max(session.idleMinutes, Math.round((idleSecondsFromEvents + trailingIdleSeconds) / 60));
+        await finalizeSession(session.id, {
+            logoutAt,
+            idleMinutes,
+        });
+    }
 }
 app.get("/", (_req, res) => {
     res.json({
@@ -217,6 +612,42 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
     const { employeeCode, email, password, deviceInfo } = req.body;
     if ((!employeeCode && !email) || !password) {
         res.status(400).json({ message: "Employee code/email and password are required" });
+        return;
+    }
+    const admin = await prisma.admin.findFirst({
+        where: {
+            OR: [
+                employeeCode ? { adminCode: employeeCode } : undefined,
+                email ? { email } : undefined,
+            ].filter(Boolean),
+        },
+    });
+    if (admin && (await bcryptjs_1.default.compare(password, admin.passwordHash))) {
+        if (admin.status !== "ACTIVE") {
+            res.status(403).json({ message: "This admin account is inactive" });
+            return;
+        }
+        const authUser = {
+            id: admin.id,
+            employeeCode: admin.adminCode,
+            firstName: admin.firstName,
+            lastName: admin.lastName,
+            email: admin.email,
+            role: admin.role,
+            accountType: "ADMIN",
+        };
+        const token = generateToken(authUser);
+        await prisma.admin.update({
+            where: { id: admin.id },
+            data: { lastLoginAt: new Date() },
+        });
+        await writeAuthAuditLog(authUser, "LOGIN", "Admin", String(admin.id));
+        res.json({
+            message: "Login successful",
+            token,
+            user: sanitizeUser(authUser),
+            deviceInfo,
+        });
         return;
     }
     const user = await prisma.user.findFirst({
@@ -243,17 +674,18 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
         lastName: user.lastName,
         email: user.email,
         role: user.role,
+        accountType: "USER",
     };
     const token = generateToken(authUser);
     await prisma.user.update({
         where: { id: user.id },
         data: { lastLoginAt: new Date() },
     });
-    await writeAuditLog(user.id, "LOGIN", "User", String(user.id));
+    await writeAuthAuditLog(authUser, "LOGIN", "User", String(user.id));
     res.json({
         message: "Login successful",
         token,
-        user: sanitizeUser(user),
+        user: sanitizeUser({ ...user, accountType: "USER" }),
         deviceInfo,
     });
 }));
@@ -271,18 +703,24 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
         });
         return;
     }
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) {
+        res.status(400).json({ message: passwordError });
+        return;
+    }
     // Validate official email
-    if (!email.endsWith("@bridgegroupsolutions.com")) {
+    if (!email.endsWith("@bridgegroupsolutions.com") && !email.endsWith("@employmentexpress.org")) {
         res.status(400).json({
             message: "Use your official company email",
         });
         return;
     }
     // Check existing user
-    const existingUser = await prisma.user.findUnique({
-        where: { email },
-    });
-    if (existingUser) {
+    const [existingUser, existingAdmin] = await Promise.all([
+        prisma.user.findUnique({ where: { email } }),
+        prisma.admin.findUnique({ where: { email } }),
+    ]);
+    if (existingUser || existingAdmin) {
         res.status(400).json({
             message: "Account already exists",
         });
@@ -329,6 +767,11 @@ app.post("/api/auth/create-password", asyncHandler(async (req, res) => {
     const { employeeCode, email, otp, password } = req.body;
     if (!employeeCode || !email || !password) {
         res.status(400).json({ message: "Employee code, email, and new password are required" });
+        return;
+    }
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) {
+        res.status(400).json({ message: passwordError });
         return;
     }
     if (otp && otp !== "123456") {
@@ -378,6 +821,11 @@ app.post("/api/auth/logout", authenticate, asyncHandler(async (req, res) => {
         res.status(401).json({ message: "Authentication required" });
         return;
     }
+    if (user.accountType === "ADMIN") {
+        await writeAuthAuditLog(user, "LOGOUT", "Admin", String(user.id));
+        res.json({ message: "Logout successful" });
+        return;
+    }
     const activeSession = await prisma.loginSession.findFirst({
         where: {
             userId: user.id,
@@ -391,7 +839,7 @@ app.post("/api/auth/logout", authenticate, asyncHandler(async (req, res) => {
         return;
     }
     const result = await finalizeSession(activeSession.id, req.body);
-    await writeAuditLog(user.id, "LOGOUT", "LoginSession", String(activeSession.id));
+    await writeAuthAuditLog(user, "LOGOUT", "LoginSession", String(activeSession.id));
     res.json({
         message: "Logout successful",
         ...result,
@@ -403,6 +851,13 @@ app.get("/api/auth/me", authenticate, asyncHandler(async (req, res) => {
         res.status(401).json({ message: "Authentication required" });
         return;
     }
+    if (user.accountType === "ADMIN") {
+        const admin = await prisma.admin.findUnique({
+            where: { id: user.id },
+        });
+        res.json({ user: admin ? sanitizeUser({ ...user, employeeCode: admin.adminCode }) : user });
+        return;
+    }
     const fullUser = await prisma.user.findUnique({
         where: { id: user.id },
         include: { department: true, shift: true },
@@ -410,21 +865,47 @@ app.get("/api/auth/me", authenticate, asyncHandler(async (req, res) => {
     res.json({ user: fullUser ? sanitizeUser(fullUser) : user });
 }));
 app.get("/api/employees", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (_req, res) => {
+    await finalizeStaleActiveSessions();
+    const today = dayStart();
+    const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
     const employees = await prisma.user.findMany({
+        where: {
+            role: client_1.UserRole.EMPLOYEE,
+        },
         include: {
             department: true,
             shift: true,
             loginSessions: {
-                orderBy: { loginAt: "desc" },
+                where: {
+                    OR: [
+                        { status: client_1.SessionStatus.ACTIVE },
+                        {
+                            loginAt: {
+                                gte: today,
+                                lt: tomorrow,
+                            },
+                        },
+                    ],
+                },
+                orderBy: [{ status: "asc" }, { loginAt: "desc" }],
                 take: 1,
             },
             productivityRecords: {
+                where: {
+                    date: today,
+                },
                 orderBy: { date: "desc" },
                 take: 1,
             },
             attendanceRecords: {
+                where: {
+                    date: today,
+                },
                 orderBy: { date: "desc" },
                 take: 1,
+            },
+            assignedWorkflows: {
+                select: { id: true },
             },
         },
         orderBy: { firstName: "asc" },
@@ -470,6 +951,11 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
         res.status(401).json({ message: "Authentication required" });
         return;
     }
+    if (!isEmployeeAccount(user)) {
+        res.status(403).json({ message: "Only employee accounts can start tracking" });
+        return;
+    }
+    await finalizeStaleActiveSessions(user.id);
     const existing = await prisma.loginSession.findFirst({
         where: { userId: user.id, status: client_1.SessionStatus.ACTIVE },
     });
@@ -477,21 +963,14 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
         res.json({ message: "Tracking already active", session: existing });
         return;
     }
-    const fullUser = await prisma.user.findUnique({
-        where: { id: user.id },
-        include: { shift: true },
-    });
     const loginAt = new Date();
     const date = dayStart(loginAt);
-    const shiftStart = shiftStartForDate(loginAt, fullUser?.shift?.startTime || "09:00");
-    const graceMinutes = fullUser?.shift?.graceMinutes || 10;
-    const lateMinutes = Math.max(0, minutesBetween(shiftStart, loginAt) - graceMinutes);
-    const attendanceStatus = lateMinutes > 0 ? client_1.AttendanceStatus.LATE : client_1.AttendanceStatus.PRESENT;
+    const { lateMinutes, status: attendanceStatus } = attendanceForLogin(loginAt);
     const session = await prisma.loginSession.create({
         data: {
             userId: user.id,
             loginAt,
-            deviceInfo: req.body.deviceInfo ?? null,
+            deviceInfo: req.body?.deviceInfo ?? null,
             ipAddress: req.ip ?? null,
             events: {
                 create: {
@@ -521,7 +1000,7 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
             status: attendanceStatus,
         },
     });
-    await writeAuditLog(user.id, "START_TRACKING", "LoginSession", String(session.id));
+    await writeAuthAuditLog(user, "START_TRACKING", "LoginSession", String(session.id));
     io.emit("session-started", { session, user });
     res.status(201).json({
         message: "Tracking started",
@@ -529,11 +1008,128 @@ app.post("/api/tracking/start", authenticate, asyncHandler(async (req, res) => {
         attendanceStatus,
     });
 }));
+app.get("/api/employees/:id/workday-stats", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const id = Number(req.params.id);
+    const requestedDate = req.query.date ? dayStart(String(req.query.date)) : dayStart();
+    const nextDate = new Date(requestedDate.getTime() + 24 * 60 * 60 * 1000);
+    const today = dayStart();
+    const isToday = requestedDate.getTime() === today.getTime();
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (user.id !== id && !adminLikeRoles.includes(user.role)) {
+        res.status(403).json({ message: "You can view only your own workday stats" });
+        return;
+    }
+    await finalizeStaleActiveSessions(id);
+    const session = await prisma.loginSession.findFirst({
+        where: {
+            userId: id,
+            OR: [
+                ...(isToday ? [{ status: client_1.SessionStatus.ACTIVE }] : []),
+                {
+                    loginAt: {
+                        gte: requestedDate,
+                        lt: nextDate,
+                    },
+                },
+            ],
+        },
+        orderBy: [{ status: "asc" }, { loginAt: "desc" }],
+    });
+    if (!session) {
+        res.json({
+            date: requestedDate,
+            sessionId: null,
+            loginTime: null,
+            activeMinutes: 0,
+            idleMinutes: 0,
+            productiveMinutes: 0,
+            productivity: 0,
+            attendance: "NOT_MARKED",
+            isFinalized: false,
+        });
+        return;
+    }
+    const productivityRecord = await prisma.productivityRecord.findUnique({
+        where: {
+            userId_date: {
+                userId: id,
+                date: dayStart(session.loginAt),
+            },
+        },
+    });
+    const attendanceRecord = await prisma.attendanceRecord.findUnique({
+        where: {
+            userId_date: {
+                userId: id,
+                date: requestedDate,
+            },
+        },
+    });
+    const events = await prisma.trackingEvent.findMany({
+        where: {
+            sessionId: session.id,
+        },
+        orderBy: {
+            createdAt: "asc",
+        },
+    });
+    let idleMinutes = 0;
+    let idleStart = null;
+    for (const event of events) {
+        if (event.type === "IDLE_START") {
+            idleStart = event.createdAt;
+        }
+        if (event.type === "IDLE_END" &&
+            idleStart) {
+            idleMinutes += Math.floor((event.createdAt.getTime() -
+                idleStart.getTime()) /
+                60000);
+            idleStart = null;
+        }
+    }
+    const nonWorkingUsageMinutes = Math.round(events.reduce((sum, event) => {
+        if (event.type !== client_1.TrackingEventType.APP_USAGE) {
+            return sum;
+        }
+        const category = appUsageCategory(event);
+        if (category !== "UNPRODUCTIVE" && category !== "NETWORK") {
+            return sum;
+        }
+        return sum + (event.durationSeconds ?? 0);
+    }, 0) / 60);
+    const endTime = session.logoutAt || new Date();
+    const totalMinutes = Math.floor((endTime.getTime() -
+        session.loginAt.getTime()) /
+        60000);
+    const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+    const activeMinutes = Math.max(0, totalMinutes - idleMinutes - session.breakMinutes - nonWorkingUsageMinutes);
+    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, idleMinutes, session.breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
+    const productivity = productivityPercent(productiveMinutes, totalMinutes);
+    res.json({
+        date: requestedDate,
+        sessionId: session.id,
+        loginTime: session.loginAt,
+        activeMinutes: productivityRecord?.activeMinutes ?? activeMinutes,
+        idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
+        productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
+        productivity: productivityRecord?.productivityPercent ?? productivity,
+        attendance: attendanceRecord?.status ?? "NOT_MARKED",
+        isFinalized: session.status === client_1.SessionStatus.COMPLETED,
+    });
+}));
 app.post("/api/tracking/event", authenticate, asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
     const { sessionId, type, durationSeconds, appName, windowTitle, metadata } = req.body;
     if (!user) {
         res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (!isEmployeeAccount(user)) {
+        res.status(403).json({ message: "Only employee accounts can record tracking events" });
         return;
     }
     if (!Object.values(client_1.TrackingEventType).includes(type)) {
@@ -570,11 +1166,103 @@ app.post("/api/tracking/event", authenticate, asyncHandler(async (req, res) => {
     io.emit("tracking-event", { event, userId: user.id });
     res.status(201).json({ message: "Tracking event recorded", event });
 }));
+app.post("/api/screenshots", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const { sessionId, imageDataUrl, capturedAt, isIdle = false, appName, windowTitle } = req.body;
+    const parsedSessionId = Number(sessionId);
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (!isEmployeeAccount(user)) {
+        res.status(403).json({ message: "Only employee accounts can upload screenshots" });
+        return;
+    }
+    if (!parsedSessionId || typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
+        res.status(400).json({ message: "Session and screenshot image are required" });
+        return;
+    }
+    const session = await prisma.loginSession.findFirst({
+        where: {
+            id: parsedSessionId,
+            userId: user.id,
+            status: client_1.SessionStatus.ACTIVE,
+        },
+    });
+    if (!session) {
+        res.status(403).json({ message: "Screenshots can be uploaded only during an active clock-in session" });
+        return;
+    }
+    const screenshot = await prisma.employeeScreenshot.create({
+        data: {
+            userId: user.id,
+            sessionId: session.id,
+            imageDataUrl,
+            capturedAt: capturedAt ? new Date(capturedAt) : new Date(),
+            isIdle: Boolean(isIdle),
+            appName: appName ? String(appName) : null,
+            windowTitle: windowTitle ? String(windowTitle) : null,
+        },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+        },
+    });
+    io.emit("employee-screenshot", {
+        screenshotId: screenshot.id,
+        userId: user.id,
+        capturedAt: screenshot.capturedAt,
+        isIdle: screenshot.isIdle,
+    });
+    res.status(201).json({ message: "Screenshot captured", screenshot });
+}));
+app.get("/api/screenshots", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    const userId = req.query.userId ? Number(req.query.userId) : undefined;
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 24));
+    const date = req.query.date ? dayStart(String(req.query.date)) : undefined;
+    const capturedAt = date
+        ? {
+            gte: date,
+            lt: new Date(date.getTime() + 24 * 60 * 60 * 1000),
+        }
+        : undefined;
+    const screenshots = await prisma.employeeScreenshot.findMany({
+        where: {
+            ...(userId ? { userId } : {}),
+            ...(capturedAt ? { capturedAt } : {}),
+        },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+        },
+        orderBy: { capturedAt: "desc" },
+        take: limit,
+    });
+    res.json({ screenshots });
+}));
 app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
     const sessionId = Number(req.body.sessionId);
     if (!user) {
         res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (!isEmployeeAccount(user)) {
+        res.status(403).json({ message: "Only employee accounts can stop tracking" });
         return;
     }
     const session = await prisma.loginSession.findFirst({
@@ -589,7 +1277,7 @@ app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
         return;
     }
     const result = await finalizeSession(session.id, req.body);
-    await writeAuditLog(user.id, "STOP_TRACKING", "LoginSession", String(session.id));
+    await writeAuthAuditLog(user, "STOP_TRACKING", "LoginSession", String(session.id));
     res.json({
         message: "Tracking stopped",
         ...result,
@@ -597,9 +1285,14 @@ app.post("/api/tracking/stop", authenticate, asyncHandler(async (req, res) => {
 }));
 app.get("/api/tracking/active-session", authenticate, async (req, res) => {
     try {
+        const user = getAuthUser(req);
+        if (!isEmployeeAccount(user)) {
+            return res.status(403).json({ message: "Only employee accounts can view active sessions" });
+        }
+        await finalizeStaleActiveSessions(user.id);
         const activeSession = await prisma.loginSession.findFirst({
             where: {
-                userId: req.user.id,
+                userId: user.id,
                 logoutAt: null,
             },
             orderBy: {
@@ -622,9 +1315,23 @@ app.get("/api/tracking/active-session", authenticate, async (req, res) => {
                 createdAt: "desc",
             },
         });
+        const latestIdleEvent = await prisma.trackingEvent.findFirst({
+            where: {
+                sessionId: activeSession.id,
+                type: {
+                    in: ["IDLE_START", "IDLE_END"],
+                },
+            },
+            orderBy: {
+                createdAt: "desc",
+            },
+        });
         res.json({
             activeSession,
+            breakStartedAt: latestBreakEvent?.type === "BREAK_START" ? latestBreakEvent.createdAt : null,
+            idleStartedAt: latestIdleEvent?.type === "IDLE_START" ? latestIdleEvent.createdAt : null,
             isOnBreak: latestBreakEvent?.type === "BREAK_START",
+            isIdle: latestIdleEvent?.type === "IDLE_START",
         });
     }
     catch (error) {
@@ -636,9 +1343,13 @@ app.get("/api/tracking/active-session", authenticate, async (req, res) => {
 });
 app.get("/api/tracking/latest-session", authenticate, async (req, res) => {
     try {
+        const user = getAuthUser(req);
+        if (!isEmployeeAccount(user)) {
+            return res.status(403).json({ message: "Only employee accounts can view latest sessions" });
+        }
         const latestSession = await prisma.loginSession.findFirst({
             where: {
-                userId: req.user.id,
+                userId: user.id,
             },
             orderBy: {
                 loginAt: "desc",
@@ -657,7 +1368,24 @@ app.get("/api/tracking/latest-session", authenticate, async (req, res) => {
 });
 app.get("/api/tracking/events/:sessionId", authenticate, async (req, res) => {
     try {
+        const user = getAuthUser(req);
         const sessionId = Number(req.params.sessionId);
+        if (!user) {
+            res.status(401).json({ message: "Authentication required" });
+            return;
+        }
+        const session = await prisma.loginSession.findUnique({
+            where: { id: sessionId },
+            select: { userId: true },
+        });
+        if (!session) {
+            res.status(404).json({ message: "Tracking session not found" });
+            return;
+        }
+        if (session.userId !== user.id && !adminLikeRoles.includes(user.role)) {
+            res.status(403).json({ message: "You can view only your own tracking events" });
+            return;
+        }
         const events = await prisma.trackingEvent.findMany({
             where: {
                 sessionId,
@@ -677,9 +1405,236 @@ app.get("/api/tracking/events/:sessionId", authenticate, async (req, res) => {
         });
     }
 });
+app.get("/api/employees/:id/app-usage", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const id = Number(req.params.id);
+    const requestedSessionId = req.query.sessionId ? Number(req.query.sessionId) : null;
+    const requestedDate = req.query.date ? dayStart(String(req.query.date)) : null;
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (user.id !== id && !adminLikeRoles.includes(user.role)) {
+        res.status(403).json({ message: "You can view only your own app usage" });
+        return;
+    }
+    await finalizeStaleActiveSessions(id);
+    const session = requestedSessionId
+        ? await prisma.loginSession.findFirst({
+            where: {
+                id: requestedSessionId,
+                userId: id,
+            },
+        })
+        : await prisma.loginSession.findFirst({
+            where: {
+                userId: id,
+                ...(requestedDate
+                    ? {
+                        loginAt: {
+                            gte: requestedDate,
+                            lt: new Date(requestedDate.getTime() + 24 * 60 * 60 * 1000),
+                        },
+                    }
+                    : {}),
+            },
+            orderBy: [{ status: "asc" }, { loginAt: "desc" }],
+        });
+    if (!session) {
+        res.json({ date: requestedDate, session: null, usage: [] });
+        return;
+    }
+    const events = await prisma.trackingEvent.findMany({
+        where: {
+            sessionId: session.id,
+            type: client_1.TrackingEventType.APP_USAGE,
+        },
+        orderBy: { createdAt: "asc" },
+    });
+    const usageByKey = new Map();
+    for (const event of events) {
+        const appName = event.appName || "Unknown app";
+        const windowTitle = event.windowTitle || "Unknown window";
+        const category = appUsageCategory(event);
+        const key = `${appName}\u0000${windowTitle}\u0000${category}`;
+        const existing = usageByKey.get(key);
+        const durationSeconds = event.durationSeconds ?? 0;
+        if (existing) {
+            existing.durationSeconds += durationSeconds;
+            existing.lastSeenAt = event.createdAt;
+        }
+        else {
+            usageByKey.set(key, {
+                appName,
+                windowTitle,
+                category,
+                durationSeconds,
+                firstSeenAt: event.createdAt,
+                lastSeenAt: event.createdAt,
+            });
+        }
+    }
+    res.json({
+        date: requestedDate ?? dayStart(session.loginAt),
+        session,
+        usage: Array.from(usageByKey.values())
+            .filter((item) => item.durationSeconds > 0)
+            .sort((a, b) => b.durationSeconds - a.durationSeconds),
+    });
+}));
+app.get("/api/admin/session-usage", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    await finalizeStaleActiveSessions();
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    const since = req.query.since
+        ? dayStart(String(req.query.since))
+        : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const sessions = await prisma.loginSession.findMany({
+        where: {
+            user: { role: client_1.UserRole.EMPLOYEE },
+            OR: [
+                { status: client_1.SessionStatus.ACTIVE },
+                { loginAt: { gte: since } },
+                { logoutAt: { gte: since } },
+            ],
+        },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+            events: {
+                where: {
+                    type: {
+                        in: [
+                            client_1.TrackingEventType.APP_USAGE,
+                            client_1.TrackingEventType.IDLE_START,
+                            client_1.TrackingEventType.IDLE_END,
+                            client_1.TrackingEventType.BREAK_START,
+                            client_1.TrackingEventType.BREAK_END,
+                            client_1.TrackingEventType.LOGIN,
+                            client_1.TrackingEventType.KEYBOARD,
+                            client_1.TrackingEventType.MOUSE,
+                            client_1.TrackingEventType.SCREEN_UNLOCK,
+                        ],
+                    },
+                },
+                orderBy: { createdAt: "asc" },
+            },
+        },
+        orderBy: { loginAt: "desc" },
+        take: limit,
+    });
+    const rows = [];
+    for (const session of sessions) {
+        const endTime = session.logoutAt || new Date();
+        const idleSecondsFromEvents = secondsFromEventPairs(session.events, client_1.TrackingEventType.IDLE_START, client_1.TrackingEventType.IDLE_END, endTime);
+        const trailingIdleSeconds = session.status === client_1.SessionStatus.COMPLETED
+            ? trailingIdleSecondsAfterLastActivity(session.events, session.loginAt, endTime)
+            : 0;
+        const breakSecondsFromEvents = secondsFromEventPairs(session.events, client_1.TrackingEventType.BREAK_START, client_1.TrackingEventType.BREAK_END, endTime);
+        const idleMinutes = Math.max(session.status === client_1.SessionStatus.ACTIVE
+            ? await idleMinutesWithOpenIdle(session.id, session.idleMinutes, endTime)
+            : session.idleMinutes, Math.round((idleSecondsFromEvents + trailingIdleSeconds) / 60));
+        const breakMinutes = Math.max(session.breakMinutes, Math.round(breakSecondsFromEvents / 60));
+        const usageByKey = new Map();
+        for (const event of session.events) {
+            if (event.type !== client_1.TrackingEventType.APP_USAGE) {
+                continue;
+            }
+            const appName = event.appName || "Unknown app";
+            const windowTitle = event.windowTitle || "Unknown window";
+            const category = appUsageCategory(event);
+            const key = `${appName}\u0000${windowTitle}\u0000${category}`;
+            const existing = usageByKey.get(key);
+            const durationSeconds = event.durationSeconds ?? 0;
+            if (existing) {
+                existing.durationSeconds += durationSeconds;
+                existing.lastSeenAt = event.createdAt;
+            }
+            else {
+                usageByKey.set(key, {
+                    appName,
+                    windowTitle,
+                    category,
+                    durationSeconds,
+                    firstSeenAt: event.createdAt,
+                    lastSeenAt: event.createdAt,
+                });
+            }
+        }
+        const usageRows = Array.from(usageByKey.values()).filter((item) => item.durationSeconds > 0);
+        const unproductiveAppMinutes = Math.round(usageRows
+            .filter((item) => item.category === "UNPRODUCTIVE")
+            .reduce((sum, item) => sum + item.durationSeconds, 0) / 60);
+        const networkInterruptionMinutes = Math.round(usageRows
+            .filter((item) => item.category === "NETWORK")
+            .reduce((sum, item) => sum + item.durationSeconds, 0) / 60);
+        const unproductiveMinutes = idleMinutes + unproductiveAppMinutes;
+        const nonWorkingUsageMinutes = unproductiveAppMinutes + networkInterruptionMinutes;
+        const totalMinutes = minutesBetween(session.loginAt, endTime);
+        const activeMinutes = Math.max(0, totalMinutes - idleMinutes - breakMinutes - nonWorkingUsageMinutes);
+        const breakAllowanceMinutes = await getBreakAllowanceMinutes();
+        const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
+        const autoClosedAt = new Date(dayStart(session.loginAt).getTime() + 24 * 60 * 60 * 1000);
+        const sessionLabel = session.status === client_1.SessionStatus.ACTIVE
+            ? "Active"
+            : session.logoutAt?.getTime() === autoClosedAt.getTime()
+                ? "Auto Closed"
+                : "Completed";
+        const baseRow = {
+            sessionId: session.id,
+            userId: session.userId,
+            employeeCode: session.user.employeeCode,
+            employeeName: `${session.user.firstName} ${session.user.lastName}`,
+            department: session.user.department?.name || "Unassigned",
+            loginAt: session.loginAt,
+            logoutAt: session.logoutAt,
+            sessionStatus: session.status,
+            sessionLabel,
+            totalMinutes,
+            idleMinutes,
+            breakMinutes,
+            activeMinutes,
+            productiveMinutes,
+            unproductiveMinutes,
+            unproductiveAppMinutes,
+            networkInterruptionMinutes,
+        };
+        if (usageRows.length === 0) {
+            rows.push({
+                ...baseRow,
+                appName: "No app or website recorded",
+                windowTitle: "--",
+                category: "UNRECORDED",
+                appDurationSeconds: 0,
+                firstSeenAt: null,
+                lastSeenAt: null,
+            });
+            continue;
+        }
+        for (const usage of usageRows.sort((a, b) => b.durationSeconds - a.durationSeconds)) {
+            rows.push({
+                ...baseRow,
+                appName: usage.appName,
+                windowTitle: usage.windowTitle,
+                category: usage.category,
+                appDurationSeconds: usage.durationSeconds,
+                firstSeenAt: usage.firstSeenAt,
+                lastSeenAt: usage.lastSeenAt,
+            });
+        }
+    }
+    res.json({ rows });
+}));
 app.get("/api/tracking/live", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (_req, res) => {
+    await finalizeStaleActiveSessions();
     const users = await prisma.user.findMany({
-        where: { status: "ACTIVE" },
+        where: { status: "ACTIVE", role: client_1.UserRole.EMPLOYEE },
         include: {
             department: true,
             loginSessions: {
@@ -700,10 +1655,136 @@ app.get("/api/tracking/live", authenticate, requireRoles(client_1.UserRole.ADMIN
         })),
     });
 }));
+app.get("/api/admin/dashboard-stats", authenticate, async (req, res) => {
+    try {
+        await finalizeStaleActiveSessions();
+        const today = dayStart();
+        const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+        // Total employees count (all roles)
+        const totalEmployees = await prisma.user.count({
+            where: {
+                role: client_1.UserRole.EMPLOYEE,
+            },
+        });
+        const [sessionsToday, activeSessions, productivityRecords, breakAllowanceMinutes] = await Promise.all([
+            prisma.loginSession.findMany({
+                where: {
+                    loginAt: {
+                        gte: today,
+                        lt: tomorrow,
+                    },
+                    user: { role: client_1.UserRole.EMPLOYEE },
+                },
+                orderBy: { loginAt: "desc" },
+            }),
+            prisma.loginSession.findMany({
+                where: {
+                    status: client_1.SessionStatus.ACTIVE,
+                    user: { role: client_1.UserRole.EMPLOYEE },
+                },
+                orderBy: { loginAt: "desc" },
+            }),
+            prisma.productivityRecord.findMany({
+                where: {
+                    date: today,
+                    user: { role: client_1.UserRole.EMPLOYEE },
+                },
+            }),
+            getBreakAllowanceMinutes(),
+        ]);
+        const latestSessionByUser = new Map();
+        for (const session of sessionsToday) {
+            if (!latestSessionByUser.has(session.userId)) {
+                latestSessionByUser.set(session.userId, session);
+            }
+        }
+        const activeSessionByUser = new Map();
+        for (const session of activeSessions) {
+            if (!activeSessionByUser.has(session.userId)) {
+                activeSessionByUser.set(session.userId, session);
+            }
+        }
+        const loggedInUserIds = new Set(sessionsToday.map((session) => session.userId));
+        const activeEmployees = activeSessionByUser.size;
+        const activeSessionIds = activeSessions.map((session) => session.id);
+        const activeStateEvents = activeSessionIds.length > 0
+            ? await prisma.trackingEvent.findMany({
+                where: {
+                    sessionId: { in: activeSessionIds },
+                    type: {
+                        in: [
+                            client_1.TrackingEventType.BREAK_START,
+                            client_1.TrackingEventType.BREAK_END,
+                            client_1.TrackingEventType.IDLE_START,
+                            client_1.TrackingEventType.IDLE_END,
+                        ],
+                    },
+                },
+                orderBy: { createdAt: "desc" },
+            })
+            : [];
+        const latestBreakEventBySession = new Map();
+        const latestIdleEventBySession = new Map();
+        for (const event of activeStateEvents) {
+            if (event.sessionId &&
+                (event.type === client_1.TrackingEventType.BREAK_START || event.type === client_1.TrackingEventType.BREAK_END) &&
+                !latestBreakEventBySession.has(event.sessionId)) {
+                latestBreakEventBySession.set(event.sessionId, event);
+            }
+            if (event.sessionId &&
+                (event.type === client_1.TrackingEventType.IDLE_START || event.type === client_1.TrackingEventType.IDLE_END) &&
+                !latestIdleEventBySession.has(event.sessionId)) {
+                latestIdleEventBySession.set(event.sessionId, event);
+            }
+        }
+        const breakEmployees = Array.from(latestBreakEventBySession.values()).filter((event) => event.type === client_1.TrackingEventType.BREAK_START).length;
+        const idleEmployees = Array.from(latestIdleEventBySession.values()).filter((event) => event.type === client_1.TrackingEventType.IDLE_START).length;
+        const productivityByUser = new Map(productivityRecords.map((record) => [record.userId, record.productivityPercent]));
+        const trackedUserIds = new Set([...loggedInUserIds, ...activeSessionByUser.keys()]);
+        const productivityValues = Array.from(trackedUserIds).map((userId) => {
+            const storedPercent = productivityByUser.get(userId);
+            if (typeof storedPercent === "number") {
+                return storedPercent;
+            }
+            const session = latestSessionByUser.get(userId) || activeSessionByUser.get(userId);
+            if (!session) {
+                return 0;
+            }
+            const endTime = session.logoutAt || new Date();
+            const loginMinutes = minutesBetween(session.loginAt, endTime);
+            const productiveMinutes = productiveMinutesWithBreakAllowance(loginMinutes, session.idleMinutes, session.breakMinutes, breakAllowanceMinutes);
+            return productivityPercent(productiveMinutes, loginMinutes);
+        });
+        const avgProductivity = productivityValues.length > 0
+            ? Math.round(productivityValues.reduce((sum, value) => sum + value, 0) / productivityValues.length)
+            : 0;
+        const presentCount = loggedInUserIds.size;
+        const attendancePercent = totalEmployees > 0 ? Math.round((presentCount / totalEmployees) * 100) : 0;
+        res.json({
+            totalEmployees,
+            activeEmployees,
+            breakEmployees,
+            idleEmployees,
+            avgProductivity,
+            attendancePercent,
+            presentCount,
+            totalRecorded: presentCount,
+        });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({
+            message: "Failed to fetch dashboard stats",
+        });
+    }
+});
 app.get("/api/productivity/summary", authenticate, asyncHandler(async (_req, res) => {
     const today = dayStart();
     const records = await prisma.productivityRecord.findMany({
-        where: { date: today },
+        where: {
+            date: today,
+            user: { role: client_1.UserRole.EMPLOYEE },
+        },
         include: { user: { include: { department: true } } },
         orderBy: { productivityPercent: "desc" },
     });
@@ -745,10 +1826,11 @@ app.get("/api/productivity/employee/:id", authenticate, asyncHandler(async (req,
         res.status(403).json({ message: "You can view only your own productivity records" });
         return;
     }
+    const take = req.query.all === "true" ? undefined : 31;
     const records = await prisma.productivityRecord.findMany({
         where: { userId: employeeId },
         orderBy: { date: "desc" },
-        take: 31,
+        ...(take ? { take } : {}),
     });
     res.json({ records });
 }));
@@ -761,6 +1843,7 @@ app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
     }
     const canViewAny = adminLikeRoles.includes(user.role);
     const userId = canViewAny ? requestedUserId : user.id;
+    const take = req.query.all === "true" ? undefined : 100;
     const records = await prisma.attendanceRecord.findMany({
         where: userId ? { userId } : {},
         include: {
@@ -774,7 +1857,7 @@ app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
             },
         },
         orderBy: { date: "desc" },
-        take: 100,
+        ...(take ? { take } : {}),
     });
     res.json({ records });
 }));
@@ -794,6 +1877,9 @@ app.get("/api/workflows", authenticate, asyncHandler(async (req, res) => {
             createdBy: {
                 select: { id: true, firstName: true, lastName: true },
             },
+            createdByAdmin: {
+                select: { id: true, firstName: true, lastName: true, adminCode: true },
+            },
             department: true,
         },
         orderBy: { updatedAt: "desc" },
@@ -802,7 +1888,7 @@ app.get("/api/workflows", authenticate, asyncHandler(async (req, res) => {
 }));
 app.post("/api/workflows", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER), asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
-    const { title, description, assignedToId, departmentId, dueDate, priority } = req.body;
+    const { title, description, assignedToId, departmentId, dueDate, priority, estimatedHours } = req.body;
     if (!title) {
         res.status(400).json({ message: "Workflow title is required" });
         return;
@@ -810,16 +1896,30 @@ app.post("/api/workflows", authenticate, requireRoles(client_1.UserRole.ADMIN, c
     const workflowData = {
         title,
         description: description ?? null,
-        assignedToId: assignedToId ? Number(assignedToId) : null,
-        departmentId: departmentId ? Number(departmentId) : null,
-        createdById: user?.id ?? null,
         dueDate: dueDate ? new Date(dueDate) : null,
+        estimatedHours: estimatedHours ? Number(estimatedHours) : null,
         priority: priority || client_1.WorkflowPriority.MEDIUM,
     };
+    const workflowAssignedToId = assignedToId ? Number(assignedToId) : null;
+    const workflowDepartmentId = departmentId ? Number(departmentId) : null;
+    const workflowCreatedById = userActorId(user);
+    const workflowCreatedByAdminId = adminActorId(user);
+    if (workflowAssignedToId) {
+        workflowData.assignedTo = { connect: { id: workflowAssignedToId } };
+    }
+    if (workflowDepartmentId) {
+        workflowData.department = { connect: { id: workflowDepartmentId } };
+    }
+    if (workflowCreatedById) {
+        workflowData.createdBy = { connect: { id: workflowCreatedById } };
+    }
+    if (workflowCreatedByAdminId) {
+        workflowData.createdByAdmin = { connect: { id: workflowCreatedByAdminId } };
+    }
     const workflow = await prisma.workflowTask.create({
         data: workflowData,
     });
-    await writeAuditLog(user?.id || null, "CREATE_WORKFLOW", "WorkflowTask", String(workflow.id));
+    await writeAuthAuditLog(user, "CREATE_WORKFLOW", "WorkflowTask", String(workflow.id));
     io.emit("workflow-created", workflow);
     res.status(201).json({ message: "Workflow created", workflow });
 }));
@@ -857,7 +1957,7 @@ app.patch("/api/workflows/:id/status", authenticate, asyncHandler(async (req, re
         where: { id },
         data: updateData,
     });
-    await writeAuditLog(user.id, "UPDATE_WORKFLOW_STATUS", "WorkflowTask", String(id));
+    await writeAuthAuditLog(user, "UPDATE_WORKFLOW_STATUS", "WorkflowTask", String(id));
     io.emit("workflow-updated", updated);
     res.json({ message: "Workflow updated", workflow: updated });
 }));
@@ -867,9 +1967,9 @@ app.get("/api/notifications", authenticate, asyncHandler(async (req, res) => {
         res.status(401).json({ message: "Authentication required" });
         return;
     }
-    const canViewAll = adminLikeRoles.includes(user.role);
+    const canViewAdminNotifications = user.accountType === "ADMIN" || adminLikeRoles.includes(user.role);
     const notifications = await prisma.notification.findMany({
-        where: canViewAll ? {} : { OR: [{ userId: user.id }, { userId: null }] },
+        where: canViewAdminNotifications ? { userId: null } : { userId: user.id },
         orderBy: { createdAt: "desc" },
         take: 50,
     });
@@ -882,10 +1982,11 @@ app.patch("/api/notifications/:id/read", authenticate, asyncHandler(async (req, 
         res.status(401).json({ message: "Authentication required" });
         return;
     }
+    const canReadAdminNotification = user.accountType === "ADMIN" || adminLikeRoles.includes(user.role);
     const notification = await prisma.notification.findFirst({
         where: {
             id,
-            OR: [{ userId: user.id }, { userId: null }],
+            userId: canReadAdminNotification ? null : user.id,
         },
     });
     if (!notification) {
@@ -897,6 +1998,137 @@ app.patch("/api/notifications/:id/read", authenticate, asyncHandler(async (req, 
         data: { isRead: true },
     });
     res.json({ message: "Notification marked as read", notification: updated });
+}));
+app.get("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    const canViewAll = adminLikeRoles.includes(user.role);
+    const requests = await prisma.leaveRequest.findMany({
+        where: canViewAll ? {} : { userId: user.id },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+    });
+    res.json({ requests });
+}));
+app.post("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const { reason, days, type = client_1.LeaveType.SICK } = req.body;
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (user.role !== client_1.UserRole.EMPLOYEE) {
+        res.status(403).json({ message: "Only employees can send leave requests" });
+        return;
+    }
+    const leaveDays = Number(days);
+    const leaveType = String(type).toUpperCase() === client_1.LeaveType.CASUAL ? client_1.LeaveType.CASUAL : client_1.LeaveType.SICK;
+    if (!reason || !Number.isInteger(leaveDays) || leaveDays <= 0) {
+        res.status(400).json({ message: "Reason and valid leave days are required" });
+        return;
+    }
+    const { paidDays, unpaidDays } = await calculateLeavePaySplit(user.id, leaveType, leaveDays);
+    const request = await prisma.leaveRequest.create({
+        data: {
+            userId: user.id,
+            type: leaveType,
+            reason,
+            days: leaveDays,
+            paidDays,
+            unpaidDays,
+        },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+        },
+    });
+    await prisma.notification.create({
+        data: {
+            userId: null,
+            type: client_1.NotificationType.ADMIN_ANNOUNCEMENT,
+            priority: client_1.NotificationPriority.HIGH,
+            title: "Leave request pending",
+            message: `${user.firstName} ${user.lastName} requested ${leaveDays} ${leaveType.toLowerCase()} leave day${leaveDays === 1 ? "" : "s"} (${paidDays} paid, ${unpaidDays} unpaid): ${reason}`,
+        },
+    });
+    res.status(201).json({ message: "Leave request sent", request });
+}));
+app.patch("/api/leave-requests/:id", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const id = Number(req.params.id);
+    const { status } = req.body;
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (![client_1.LeaveRequestStatus.APPROVED, client_1.LeaveRequestStatus.REJECTED].includes(status)) {
+        res.status(400).json({ message: "Status must be APPROVED or REJECTED" });
+        return;
+    }
+    const existing = await prisma.leaveRequest.findUnique({
+        where: { id },
+    });
+    if (!existing) {
+        res.status(404).json({ message: "Leave request not found" });
+        return;
+    }
+    if (existing.status !== client_1.LeaveRequestStatus.PENDING) {
+        res.status(400).json({ message: "Leave request is already reviewed" });
+        return;
+    }
+    const paySplit = await calculateLeavePaySplit(existing.userId, existing.type, existing.days);
+    const updated = await prisma.leaveRequest.update({
+        where: { id },
+        data: {
+            status,
+            paidDays: status === client_1.LeaveRequestStatus.APPROVED ? paySplit.paidDays : 0,
+            unpaidDays: status === client_1.LeaveRequestStatus.APPROVED ? paySplit.unpaidDays : existing.days,
+            reviewedById: user.id,
+            reviewedAt: new Date(),
+        },
+        include: {
+            user: {
+                select: {
+                    id: true,
+                    employeeCode: true,
+                    firstName: true,
+                    lastName: true,
+                    department: true,
+                },
+            },
+        },
+    });
+    await prisma.notification.create({
+        data: {
+            userId: existing.userId,
+            type: client_1.NotificationType.ATTENDANCE_WARNING,
+            priority: status === client_1.LeaveRequestStatus.APPROVED ? client_1.NotificationPriority.MEDIUM : client_1.NotificationPriority.HIGH,
+            title: `Leave request ${String(status).toLowerCase()}`,
+            message: `Your ${existing.days} ${existing.type.toLowerCase()} leave day${existing.days === 1 ? "" : "s"} request was ${String(status).toLowerCase()} by ${user.firstName} ${user.lastName}. ${status === client_1.LeaveRequestStatus.APPROVED ? `${paySplit.paidDays} paid, ${paySplit.unpaidDays} unpaid.` : ""}`,
+        },
+    });
+    res.json({ message: `Leave request ${String(status).toLowerCase()}`, request: updated });
 }));
 app.get("/api/policies", authenticate, asyncHandler(async (_req, res) => {
     const policies = await prisma.workPolicy.findMany({
@@ -918,62 +2150,575 @@ app.put("/api/policies/:id", authenticate, requireRoles(client_1.UserRole.ADMIN,
             overtimeAfterHours: Number(overtimeAfterHours),
         },
     });
-    await writeAuditLog(user?.id || null, "UPDATE_POLICY", "WorkPolicy", String(id));
+    await writeAuthAuditLog(user, "UPDATE_POLICY", "WorkPolicy", String(id));
     res.json({ message: "Policy updated", policy: updated });
 }));
 app.get("/api/reports/daily", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
     const date = dayStart(req.query.date ? String(req.query.date) : undefined);
-    const [attendance, productivity, workflowCounts, activeSessions] = await Promise.all([
+    const tomorrow = new Date(date.getTime() + 24 * 60 * 60 * 1000);
+    const [attendance, productivityEmployees, workflowCounts, activeSessions, breakAllowanceMinutes] = await Promise.all([
         prisma.attendanceRecord.findMany({
-            where: { date },
+            where: {
+                date,
+                user: { role: client_1.UserRole.EMPLOYEE },
+            },
             include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
         }),
-        prisma.productivityRecord.findMany({
-            where: { date },
-            include: { user: { select: { employeeCode: true, firstName: true, lastName: true } } },
+        prisma.user.findMany({
+            where: { role: client_1.UserRole.EMPLOYEE },
+            include: {
+                productivityRecords: {
+                    where: { date },
+                    orderBy: { date: "desc" },
+                    take: 1,
+                },
+                loginSessions: {
+                    where: {
+                        loginAt: {
+                            gte: date,
+                            lt: tomorrow,
+                        },
+                    },
+                    orderBy: { loginAt: "desc" },
+                    take: 1,
+                },
+            },
+            orderBy: { firstName: "asc" },
         }),
         prisma.workflowTask.groupBy({
             by: ["status"],
             _count: { status: true },
         }),
-        prisma.loginSession.count({ where: { status: client_1.SessionStatus.ACTIVE } }),
+        prisma.loginSession.count({
+            where: {
+                status: client_1.SessionStatus.ACTIVE,
+                user: { role: client_1.UserRole.EMPLOYEE },
+            },
+        }),
+        getBreakAllowanceMinutes(),
     ]);
+    const productivity = productivityEmployees.map((employee) => {
+        const record = employee.productivityRecords[0];
+        if (record) {
+            return {
+                ...record,
+                user: {
+                    employeeCode: employee.employeeCode,
+                    firstName: employee.firstName,
+                    lastName: employee.lastName,
+                },
+            };
+        }
+        const session = employee.loginSessions[0];
+        const endTime = session?.logoutAt || new Date();
+        const loginMinutes = session ? minutesBetween(session.loginAt, endTime) : 0;
+        const idleMinutes = session?.idleMinutes ?? 0;
+        const breakMinutes = session?.breakMinutes ?? 0;
+        const productiveMinutes = productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes);
+        const percent = productivityPercent(productiveMinutes, loginMinutes);
+        return {
+            id: session?.id ?? employee.id,
+            userId: employee.id,
+            date,
+            loginMinutes,
+            activeMinutes: Math.max(0, loginMinutes - idleMinutes - breakMinutes),
+            idleMinutes,
+            breakMinutes,
+            productiveMinutes,
+            productivityPercent: percent,
+            score: percent,
+            createdAt: session?.createdAt ?? date,
+            updatedAt: session?.updatedAt ?? date,
+            user: {
+                employeeCode: employee.employeeCode,
+                firstName: employee.firstName,
+                lastName: employee.lastName,
+            },
+        };
+    });
     res.json({
         date,
+        generatedFor: user
+            ? {
+                employeeCode: user.employeeCode,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                email: user.email,
+                role: user.role,
+            }
+            : null,
         activeSessions,
         attendance,
         productivity,
         workflowCounts,
     });
 }));
-app.get("/api/reports/export", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (_req, res) => {
-    const records = await prisma.productivityRecord.findMany({
-        include: { user: true },
-        orderBy: { date: "desc" },
-        take: 100,
+app.get("/api/reports/all-time-summary", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (_req, res) => {
+    const [firstSession, attendanceCount, sessions, workflowCount, completedWorkflowCount, workflowCounts,] = await Promise.all([
+        prisma.loginSession.findFirst({
+            where: { user: { role: client_1.UserRole.EMPLOYEE } },
+            orderBy: { loginAt: "asc" },
+            select: { loginAt: true },
+        }),
+        prisma.attendanceRecord.count({
+            where: { user: { role: client_1.UserRole.EMPLOYEE } },
+        }),
+        prisma.loginSession.findMany({
+            where: { user: { role: client_1.UserRole.EMPLOYEE } },
+            select: {
+                loginAt: true,
+                logoutAt: true,
+                activeMinutes: true,
+                idleMinutes: true,
+                breakMinutes: true,
+                productiveMinutes: true,
+            },
+        }),
+        prisma.workflowTask.count(),
+        prisma.workflowTask.count({
+            where: { status: client_1.WorkflowStatus.COMPLETED },
+        }),
+        prisma.workflowTask.groupBy({
+            by: ["status"],
+            _count: { status: true },
+        }),
+    ]);
+    const now = new Date();
+    const sessionProductivity = sessions.map((session) => {
+        const loginMinutes = minutesBetween(session.loginAt, session.logoutAt || now);
+        const productiveMinutes = Math.max(session.productiveMinutes, productiveMinutesWithBreakAllowance(loginMinutes, session.idleMinutes, session.breakMinutes));
+        return productivityPercent(productiveMinutes, loginMinutes);
     });
+    const averageProductivity = sessionProductivity.length
+        ? Math.round(sessionProductivity.reduce((sum, percent) => sum + percent, 0) /
+            sessionProductivity.length)
+        : 0;
+    res.json({
+        firstLoginAt: firstSession?.loginAt ?? null,
+        attendanceRecords: attendanceCount,
+        productivityRecords: sessions.length,
+        averageProductivity,
+        workflows: workflowCount,
+        completedWorkflows: completedWorkflowCount,
+        workflowStatusGroups: workflowCounts.length,
+    });
+}));
+app.get("/api/reports/employee-summary", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    const employeeId = Number(req.query.employeeId);
+    if (!employeeId) {
+        res.status(400).json({ message: "employeeId is required" });
+        return;
+    }
+    const dateFilterValue = typeof req.query.date === "string" && req.query.date ? req.query.date : "";
+    const monthFilterValue = typeof req.query.month === "string" && req.query.month ? req.query.month : "";
+    const rangeStart = dateFilterValue
+        ? dayStart(dateFilterValue)
+        : monthFilterValue
+            ? new Date(`${monthFilterValue}-01T00:00:00`)
+            : null;
+    const rangeEnd = rangeStart
+        ? dateFilterValue
+            ? new Date(rangeStart.getTime() + 24 * 60 * 60 * 1000)
+            : new Date(rangeStart.getFullYear(), rangeStart.getMonth() + 1, 1)
+        : null;
+    const dateWhere = rangeStart && rangeEnd ? { gte: rangeStart, lt: rangeEnd } : undefined;
+    const [employee, sessions, attendance, workflows] = await Promise.all([
+        prisma.user.findUnique({
+            where: { id: employeeId },
+            include: { department: true },
+        }),
+        prisma.loginSession.findMany({
+            where: {
+                userId: employeeId,
+                ...(dateWhere ? { loginAt: dateWhere } : {}),
+            },
+            orderBy: { loginAt: "asc" },
+        }),
+        prisma.attendanceRecord.findMany({
+            where: {
+                userId: employeeId,
+                ...(dateWhere ? { date: dateWhere } : {}),
+            },
+            orderBy: { date: "desc" },
+        }),
+        prisma.workflowTask.findMany({
+            where: {
+                assignedToId: employeeId,
+                ...(dateWhere ? { updatedAt: dateWhere } : {}),
+            },
+            orderBy: { updatedAt: "desc" },
+        }),
+    ]);
+    if (!employee) {
+        res.status(404).json({ message: "Employee not found" });
+        return;
+    }
+    const generatedAt = new Date();
+    const sessionRows = sessions.map((session) => {
+        const endTime = session.logoutAt || generatedAt;
+        const loginMinutes = minutesBetween(session.loginAt, endTime);
+        const productiveMinutes = Math.max(session.productiveMinutes, productiveMinutesWithBreakAllowance(loginMinutes, session.idleMinutes, session.breakMinutes));
+        return {
+            loginMinutes,
+            activeMinutes: Math.max(session.activeMinutes, loginMinutes - session.idleMinutes - session.breakMinutes),
+            idleMinutes: session.idleMinutes,
+            breakMinutes: session.breakMinutes,
+            productiveMinutes,
+            productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
+        };
+    });
+    const totalLoginMinutes = sessionRows.reduce((sum, record) => sum + record.loginMinutes, 0);
+    const totalActiveMinutes = sessionRows.reduce((sum, record) => sum + record.activeMinutes, 0);
+    const totalProductiveMinutes = sessionRows.reduce((sum, record) => sum + record.productiveMinutes, 0);
+    const totalIdleMinutes = sessionRows.reduce((sum, record) => sum + record.idleMinutes, 0);
+    const totalBreakMinutes = sessionRows.reduce((sum, record) => sum + record.breakMinutes, 0);
+    const averageProductivity = sessionRows.length
+        ? Math.round(sessionRows.reduce((sum, record) => sum + record.productivityPercent, 0) / sessionRows.length)
+        : 0;
+    const completedWorkflows = workflows.filter((workflow) => workflow.status === client_1.WorkflowStatus.COMPLETED).length;
+    res.json({
+        employee: {
+            id: employee.id,
+            employeeCode: employee.employeeCode,
+            name: `${employee.firstName} ${employee.lastName}`,
+            department: employee.department?.name || "Unassigned",
+        },
+        range: dateFilterValue || monthFilterValue || "all",
+        attendanceDays: attendance.length,
+        presentDays: attendance.filter((record) => record.status === client_1.AttendanceStatus.PRESENT).length,
+        lateDays: attendance.filter((record) => record.status === client_1.AttendanceStatus.LATE).length,
+        halfDays: attendance.filter((record) => record.status === client_1.AttendanceStatus.HALF_DAY).length,
+        totalLoginMinutes,
+        totalActiveMinutes,
+        totalProductiveMinutes,
+        totalIdleMinutes,
+        totalBreakMinutes,
+        averageProductivity,
+        workflowCount: workflows.length,
+        completedWorkflows,
+    });
+}));
+app.get("/api/reports/export", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const generatedAt = new Date();
+    const employeeId = req.query.employeeId ? Number(req.query.employeeId) : undefined;
+    const dateFilterValue = typeof req.query.date === "string" && req.query.date ? req.query.date : "";
+    const monthFilterValue = typeof req.query.month === "string" && req.query.month ? req.query.month : "";
+    const rangeStart = dateFilterValue
+        ? dayStart(dateFilterValue)
+        : monthFilterValue
+            ? new Date(`${monthFilterValue}-01T00:00:00`)
+            : null;
+    const rangeEnd = rangeStart
+        ? dateFilterValue
+            ? new Date(rangeStart.getTime() + 24 * 60 * 60 * 1000)
+            : new Date(rangeStart.getFullYear(), rangeStart.getMonth() + 1, 1)
+        : null;
+    const dateWhere = rangeStart && rangeEnd ? { gte: rangeStart, lt: rangeEnd } : undefined;
+    const employeeWhere = {
+        role: client_1.UserRole.EMPLOYEE,
+        ...(employeeId ? { id: employeeId } : {}),
+    };
+    const workflowWhere = {
+        ...(employeeId ? { assignedToId: employeeId } : {}),
+        ...(dateWhere ? { updatedAt: dateWhere } : {}),
+    };
+    const [employees, attendance, productivity, workflows, workflowCounts] = await Promise.all([
+        prisma.user.findMany({
+            where: employeeWhere,
+            include: {
+                department: true,
+                loginSessions: {
+                    ...(dateWhere ? { where: { loginAt: dateWhere } } : {}),
+                    orderBy: { loginAt: "asc" },
+                },
+            },
+            orderBy: [{ firstName: "asc" }, { lastName: "asc" }],
+        }),
+        prisma.attendanceRecord.findMany({
+            where: {
+                ...(dateWhere ? { date: dateWhere } : {}),
+                user: employeeWhere,
+            },
+            include: {
+                user: {
+                    select: {
+                        employeeCode: true,
+                        firstName: true,
+                        lastName: true,
+                        department: true,
+                    },
+                },
+            },
+            orderBy: [{ userId: "asc" }, { date: "desc" }],
+        }),
+        prisma.productivityRecord.findMany({
+            where: {
+                ...(dateWhere ? { date: dateWhere } : {}),
+                user: employeeWhere,
+            },
+            include: {
+                user: {
+                    select: {
+                        employeeCode: true,
+                        firstName: true,
+                        lastName: true,
+                        department: true,
+                    },
+                },
+            },
+            orderBy: [{ userId: "asc" }, { date: "desc" }],
+        }),
+        prisma.workflowTask.findMany({
+            where: workflowWhere,
+            include: {
+                assignedTo: {
+                    select: { employeeCode: true, firstName: true, lastName: true },
+                },
+                department: true,
+            },
+            orderBy: [{ updatedAt: "desc" }],
+        }),
+        prisma.workflowTask.groupBy({
+            by: ["status"],
+            where: workflowWhere,
+            _count: { status: true },
+        }),
+    ]);
+    const productivityByUser = new Map();
+    const attendanceByUser = new Map();
+    const workflowsByUser = new Map();
+    productivity.forEach((record) => {
+        const rows = productivityByUser.get(record.userId) || [];
+        rows.push(record);
+        productivityByUser.set(record.userId, rows);
+    });
+    attendance.forEach((record) => {
+        const rows = attendanceByUser.get(record.userId) || [];
+        rows.push(record);
+        attendanceByUser.set(record.userId, rows);
+    });
+    workflows.forEach((workflow) => {
+        if (!workflow.assignedToId) {
+            return;
+        }
+        const rows = workflowsByUser.get(workflow.assignedToId) || [];
+        rows.push(workflow);
+        workflowsByUser.set(workflow.assignedToId, rows);
+    });
+    const sessionProductivityRows = employees.flatMap((employee) => employee.loginSessions.map((session) => {
+        const endTime = session.logoutAt || generatedAt;
+        const loginMinutes = minutesBetween(session.loginAt, endTime);
+        const activeMinutes = Math.max(session.activeMinutes, loginMinutes - session.idleMinutes - session.breakMinutes);
+        const productiveMinutes = Math.max(session.productiveMinutes, productiveMinutesWithBreakAllowance(loginMinutes, session.idleMinutes, session.breakMinutes));
+        return {
+            employee,
+            date: session.loginAt,
+            loginAt: session.loginAt,
+            logoutAt: session.logoutAt,
+            loginMinutes,
+            activeMinutes,
+            idleMinutes: session.idleMinutes,
+            breakMinutes: session.breakMinutes,
+            productiveMinutes,
+            productivityPercent: productivityPercent(productiveMinutes, loginMinutes),
+        };
+    }));
+    const sessionProductivityByUser = new Map();
+    sessionProductivityRows.forEach((row) => {
+        const rows = sessionProductivityByUser.get(row.employee.id) || [];
+        rows.push(row);
+        sessionProductivityByUser.set(row.employee.id, rows);
+    });
+    const summaryRows = employees.map((employee) => {
+        const employeeProductivity = sessionProductivityByUser.get(employee.id) || [];
+        const employeeAttendance = attendanceByUser.get(employee.id) || [];
+        const employeeWorkflows = workflowsByUser.get(employee.id) || [];
+        const totalLoginMinutes = employeeProductivity.reduce((sum, record) => sum + record.loginMinutes, 0);
+        const totalActiveMinutes = employeeProductivity.reduce((sum, record) => sum + record.activeMinutes, 0);
+        const totalProductiveMinutes = employeeProductivity.reduce((sum, record) => sum + record.productiveMinutes, 0);
+        const totalIdleMinutes = employeeProductivity.reduce((sum, record) => sum + record.idleMinutes, 0);
+        const totalBreakMinutes = employeeProductivity.reduce((sum, record) => sum + record.breakMinutes, 0);
+        const averageProductivity = employeeProductivity.length
+            ? Math.round(employeeProductivity.reduce((sum, record) => sum + record.productivityPercent, 0) /
+                employeeProductivity.length)
+            : 0;
+        const completedWorkflows = employeeWorkflows.filter((workflow) => workflow.status === client_1.WorkflowStatus.COMPLETED).length;
+        return {
+            employee,
+            firstLoginAt: employee.loginSessions[0]?.loginAt ?? null,
+            attendanceDays: employeeAttendance.length,
+            totalLoginMinutes,
+            totalActiveMinutes,
+            totalProductiveMinutes,
+            totalIdleMinutes,
+            totalBreakMinutes,
+            averageProductivity,
+            workflowCount: employeeWorkflows.length,
+            completedWorkflows,
+        };
+    });
+    const selectedEmployee = employeeId ? employees[0] : null;
+    const reportTitle = selectedEmployee
+        ? `${selectedEmployee.firstName} ${selectedEmployee.lastName} Work Report`
+        : "All Employee Work Report";
+    const reportRange = dateFilterValue
+        ? dateFilterValue
+        : monthFilterValue
+            ? monthFilterValue
+            : "First Login To Now";
+    const attachmentPrefix = selectedEmployee
+        ? `${selectedEmployee.employeeCode}-work-report`
+        : "all-employee-work-report";
     const csv = [
-        "Employee Code,Name,Date,Login Minutes,Idle Minutes,Break Minutes,Productive Minutes,Productivity Percent",
-        ...records.map((record) => [
+        csvRow([reportTitle]),
+        csvRow(["Report Range", reportRange]),
+        csvRow(["Generated For", user ? `${user.firstName} ${user.lastName}` : ""]),
+        csvRow(["Employee Code", user?.employeeCode || ""]),
+        csvRow(["Role", user?.role || ""]),
+        csvRow(["Email", user?.email || ""]),
+        csvRow(["Generated At", generatedAt.toISOString()]),
+        "",
+        csvRow(["Employee Summary - First Login To Now"]),
+        csvRow([
+            "Employee Code",
+            "Name",
+            "Department",
+            "First Login",
+            "Attendance Days",
+            "Total Worked Minutes",
+            "Active Minutes",
+            "Productive Minutes",
+            "Idle Minutes",
+            "Break Minutes",
+            "Average Productivity Percent",
+            "Completed Workflows",
+            "Total Workflows",
+        ]),
+        ...summaryRows.map((row) => csvRow([
+            row.employee.employeeCode,
+            `${row.employee.firstName} ${row.employee.lastName}`,
+            row.employee.department?.name || "Unassigned",
+            row.firstLoginAt ? row.firstLoginAt.toISOString() : "",
+            row.attendanceDays,
+            row.totalLoginMinutes,
+            row.totalActiveMinutes,
+            row.totalProductiveMinutes,
+            row.totalIdleMinutes,
+            row.totalBreakMinutes,
+            row.averageProductivity,
+            row.completedWorkflows,
+            row.workflowCount,
+        ])),
+        "",
+        csvRow(["Attendance History - All Employees"]),
+        csvRow([
+            "Employee Code",
+            "Name",
+            "Department",
+            "Date",
+            "Status",
+            "Clock In",
+            "Clock Out",
+            "Late Minutes",
+            "Overtime Minutes",
+            "Idle Deduction Minutes",
+        ]),
+        ...attendance.map((record) => csvRow([
             record.user.employeeCode,
             `${record.user.firstName} ${record.user.lastName}`,
+            record.user.department?.name || "Unassigned",
             record.date.toISOString().slice(0, 10),
+            record.status,
+            record.loginAt ? record.loginAt.toISOString() : "",
+            record.logoutAt ? record.logoutAt.toISOString() : "",
+            record.lateMinutes,
+            record.overtimeMinutes,
+            record.idleDeductionMinutes,
+        ])),
+        "",
+        csvRow(["Productivity History - All Employees"]),
+        csvRow([
+            "Employee Code",
+            "Name",
+            "Department",
+            "Date",
+            "Clock In",
+            "Clock Out",
+            "Login Minutes",
+            "Active Minutes",
+            "Idle Minutes",
+            "Break Minutes",
+            "Productive Minutes",
+            "Productivity Percent",
+        ]),
+        ...sessionProductivityRows
+            .sort((a, b) => b.loginAt.getTime() - a.loginAt.getTime())
+            .map((record) => csvRow([
+            record.employee.employeeCode,
+            `${record.employee.firstName} ${record.employee.lastName}`,
+            record.employee.department?.name || "Unassigned",
+            record.date.toISOString().slice(0, 10),
+            record.loginAt.toISOString(),
+            record.logoutAt ? record.logoutAt.toISOString() : "",
             record.loginMinutes,
+            record.activeMinutes,
             record.idleMinutes,
             record.breakMinutes,
             record.productiveMinutes,
             record.productivityPercent,
-        ].join(",")),
-    ].join("\n");
-    res.header("Content-Type", "text/csv");
-    res.attachment("productivity-report.csv");
+        ])),
+        "",
+        csvRow(["Workflow Efficiency Summary - All Employees"]),
+        csvRow(["Status", "Count"]),
+        ...workflowCounts.map((item) => csvRow([item.status, item._count.status])),
+        "",
+        csvRow(["Workflow Details - All Employees"]),
+        csvRow([
+            "Title",
+            "Assigned Employee Code",
+            "Assigned To",
+            "Department",
+            "Status",
+            "Priority",
+            "Estimated Hours",
+            "Actual Hours",
+            "Due Date",
+            "Completed At",
+            "Last Updated",
+        ]),
+        ...workflows.map((workflow) => csvRow([
+            workflow.title,
+            workflow.assignedTo?.employeeCode || "",
+            workflow.assignedTo
+                ? `${workflow.assignedTo.firstName} ${workflow.assignedTo.lastName}`
+                : "Unassigned",
+            workflow.department?.name || "Unassigned",
+            workflow.status,
+            workflow.priority,
+            workflow.estimatedHours ?? "",
+            workflow.actualHours ?? "",
+            workflow.dueDate ? workflow.dueDate.toISOString().slice(0, 10) : "",
+            workflow.completedAt ? workflow.completedAt.toISOString() : "",
+            workflow.updatedAt.toISOString(),
+        ])),
+    ].join("\r\n");
+    res.header("Content-Type", "text/csv; charset=utf-8");
+    res.attachment(`${attachmentPrefix}-${generatedAt.toISOString().slice(0, 10)}.csv`);
     res.send(csv);
 }));
 app.use((err, _req, res, _next) => {
     console.error(err);
+    const databaseMessage = prismaErrorMessage(err);
+    if (databaseMessage) {
+        res.status(400).json({
+            message: databaseMessage,
+        });
+        return;
+    }
     res.status(500).json({
         message: "Something went wrong on the server",
-        detail: process.env.NODE_ENV === "production" ? undefined : err.message,
     });
 });
 const PORT = Number(process.env.PORT) || 5000;
