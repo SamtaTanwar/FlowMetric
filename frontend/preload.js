@@ -8,4 +8,10 @@ contextBridge.exposeInMainWorld("desktopTracker", {
   stop() {
     return ipcRenderer.invoke("desktop-tracker:stop");
   },
+  status() {
+    return ipcRenderer.invoke("desktop-tracker:status");
+  },
+  captureNow() {
+    return ipcRenderer.invoke("desktop-tracker:capture-now");
+  },
 });

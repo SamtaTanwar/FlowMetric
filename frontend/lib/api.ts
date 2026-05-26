@@ -115,10 +115,14 @@ export function consumeProtectedNavigation(path: string) {
 }
 
 export function canOpenProtectedRoute(path: string) {
+  const hasAuthenticatedSession = Boolean(getStoredToken() && hasActiveLoginSession());
+
+  if (hasAuthenticatedSession) {
+    return true;
+  }
+
   return Boolean(
-    getStoredToken() &&
-      hasActiveLoginSession() &&
-      (consumeProtectedNavigation(path) || isProtectedRouteRefresh()),
+    getStoredToken() && (consumeProtectedNavigation(path) || isProtectedRouteRefresh()),
   );
 }
 

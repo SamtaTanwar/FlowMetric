@@ -55,13 +55,23 @@ type EmployeeNotification = {
 declare global {
   interface Window {
     desktopTracker?: {
-      start(config: { apiBaseUrl: string; token: string; sessionId: number }): Promise<{ ok: boolean }>;
+      start(config: { apiBaseUrl: string; token: string; sessionId: number }): Promise<{ ok: boolean; status?: DesktopTrackerStatus }>;
       stop(): Promise<{ ok: boolean }>;
+      status(): Promise<DesktopTrackerStatus>;
+      captureNow(): Promise<DesktopTrackerStatus>;
     };
   }
 }
 
 const BREAK_ALLOWANCE_SECONDS = 45 * 60;
+
+type DesktopTrackerStatus = {
+  isRunning: boolean;
+  lastUsage: { appName: string; windowTitle: string } | null;
+  lastError: string;
+  lastSentAt: string | null;
+  lastResponseStatus: number | null;
+};
 
 export default function EmployeeDashboard() {
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
@@ -84,6 +94,8 @@ export default function EmployeeDashboard() {
   const [notifications, setNotifications] = useState<EmployeeNotification[]>([]);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [markingNotificationId, setMarkingNotificationId] = useState<number | null>(null);
+  const [trackerStatus, setTrackerStatus] = useState<DesktopTrackerStatus | null>(null);
+  const [hasDesktopTracker, setHasDesktopTracker] = useState(false);
   const networkOfflineStartedAtRef = useRef<number | null>(null);
   const router = useRouter();
 
@@ -99,6 +111,10 @@ export default function EmployeeDashboard() {
     ? Math.min(100, Math.round((productiveSeconds / elapsedSeconds) * 100))
     : 0;
   const unreadCount = notifications.filter((item) => !item.isRead).length;
+
+  useEffect(() => {
+    setHasDesktopTracker(Boolean(window.desktopTracker));
+  }, []);
 
   useEffect(() => {
     async function verifyEmployee() {
@@ -218,9 +234,34 @@ useEffect(() => {
     apiBaseUrl: API_BASE_URL,
     token: getStoredToken(),
     sessionId,
-  }).catch(() => null);
+  })
+    .then((result) => {
+      setTrackerStatus(result.status ?? null);
+      return window.desktopTracker?.captureNow();
+    })
+    .then((status) => {
+      if (status) {
+        setTrackerStatus(status);
+      }
+    })
+    .catch((error) => {
+      setTrackerStatus({
+        isRunning: false,
+        lastUsage: null,
+        lastError: error instanceof Error ? error.message : "Desktop tracker failed to start",
+        lastSentAt: null,
+        lastResponseStatus: null,
+      });
+    });
+
+  const statusInterval = window.setInterval(() => {
+    window.desktopTracker?.status()
+      .then(setTrackerStatus)
+      .catch(() => null);
+  }, 5000);
 
   return () => {
+    window.clearInterval(statusInterval);
     window.desktopTracker?.stop().catch(() => null);
   };
 }, [isTracking, sessionId]);
@@ -274,6 +315,41 @@ useEffect(() => {
   return () => {
     window.removeEventListener("offline", handleOffline);
     window.removeEventListener("online", handleOnline);
+  };
+}, [isTracking, sessionId]);
+
+useEffect(() => {
+  if (!isTracking || !sessionId || window.desktopTracker) {
+    return;
+  }
+
+  const recordBrowserActivity = () => {
+    if (document.visibilityState !== "visible") {
+      return;
+    }
+
+    apiRequest("/api/tracking/event", {
+      method: "POST",
+      body: JSON.stringify({
+        sessionId,
+        type: "APP_USAGE",
+        durationSeconds: 5,
+        appName: "Browser",
+        windowTitle: document.title || "Employee dashboard",
+        metadata: {
+          category: "PRODUCTIVE",
+          source: "browser-page-fallback",
+          url: window.location.href,
+        },
+      }),
+    }).catch(() => null);
+  };
+
+  recordBrowserActivity();
+  const browserActivityInterval = window.setInterval(recordBrowserActivity, 5000);
+
+  return () => {
+    window.clearInterval(browserActivityInterval);
   };
 }, [isTracking, sessionId]);
 
@@ -663,6 +739,35 @@ if (!isAuthorized) {
               </h2>
             </div>
           </div>
+
+          {isTracking && hasDesktopTracker && (
+            <div className="mt-5 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <p className="font-semibold text-white">
+                  App tracker: {trackerStatus?.isRunning ? "Running" : "Starting"}
+                </p>
+                <button
+                  className="rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-xs font-semibold text-cyan-100 hover:bg-cyan-300/15"
+                  onClick={() => window.desktopTracker?.captureNow().then(setTrackerStatus)}
+                  type="button"
+                >
+                  Capture now
+                </button>
+              </div>
+              <p className="mt-2">
+                Last app: {trackerStatus?.lastUsage
+                  ? `${trackerStatus.lastUsage.appName} - ${trackerStatus.lastUsage.windowTitle}`
+                  : "Waiting for active window"}
+              </p>
+              <p className="mt-1">
+                Backend: {trackerStatus?.lastResponseStatus ?? "--"}
+                {trackerStatus?.lastSentAt ? ` at ${new Date(trackerStatus.lastSentAt).toLocaleTimeString("en-IN")}` : ""}
+              </p>
+              {trackerStatus?.lastError && (
+                <p className="mt-1 text-amber-200">{trackerStatus.lastError}</p>
+              )}
+            </div>
+          )}
 
                            {/* Action Panel */}
           <div

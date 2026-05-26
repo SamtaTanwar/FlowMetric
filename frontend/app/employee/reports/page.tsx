@@ -125,6 +125,21 @@ export default function EmployeeReportsPage() {
   const [currentTimestamp, setCurrentTimestamp] = useState(() => Date.now());
 
   useEffect(() => {
+    const allowEmployeeReturn = () => {
+      allowProtectedNavigation("/employee");
+    };
+
+    window.addEventListener("pagehide", allowEmployeeReturn);
+    window.addEventListener("popstate", allowEmployeeReturn);
+
+    return () => {
+      allowEmployeeReturn();
+      window.removeEventListener("pagehide", allowEmployeeReturn);
+      window.removeEventListener("popstate", allowEmployeeReturn);
+    };
+  }, []);
+
+  useEffect(() => {
     let isCurrent = true;
     const hasRouteAccess = canOpenProtectedRoute("/employee/reports");
 
@@ -293,6 +308,11 @@ export default function EmployeeReportsPage() {
     }
   }
 
+  function handleBackToEmployeeDashboard() {
+    allowProtectedNavigation("/employee");
+    router.push("/employee");
+  }
+
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#050816] text-white">
       <div className="absolute left-[-10%] top-[-10%] h-[500px] w-[500px] rounded-full bg-blue-600/20 blur-3xl" />
@@ -310,9 +330,19 @@ export default function EmployeeReportsPage() {
               Analytics Dashboard
             </p>
 
-            <h1 className="mt-4 text-5xl font-semibold tracking-[-0.04em] text-white">
-              Work Reports
-            </h1>
+            <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <h1 className="text-5xl font-semibold tracking-[-0.04em] text-white">
+                Work Reports
+              </h1>
+
+              <button
+                className="inline-flex h-11 items-center justify-center rounded-xl border border-white/10 bg-white/6 px-4 text-sm font-semibold text-slate-200 hover:bg-white/10"
+                onClick={handleBackToEmployeeDashboard}
+                type="button"
+              >
+                Back to dashboard
+              </button>
+            </div>
 
             <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-300">
               Monitor productivity, work activity, attendance insights and session analytics.

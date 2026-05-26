@@ -28,17 +28,17 @@ fs.copyFileSync(path.join(rootDir, "preload.js"), path.join(appDir, "preload.js"
 copyDir(outDir, path.join(appDir, "out"));
 
 const packageJson = {
-  name: "employee-workflow-tracking",
+  name: "flowmetric",
   version: "0.1.0",
   private: true,
   main: "electron.js",
-  description: "Employee Workflow Tracking Desktop App",
+  description: "FlowMetric Desktop App",
   author: "Nandni",
   dependencies: {},
   devDependencies: {},
   build: {
     appId: "com.employee.workflow",
-    productName: "Employee Workflow Tracking",
+    productName: "FlowMetric",
     electronVersion: "42.2.0",
     asar: false,
     npmRebuild: false,

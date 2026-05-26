@@ -4,7 +4,7 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, LockKeyhole, Mail } from "lucide-react";
+import { ArrowLeft, ArrowRight, LockKeyhole, Mail } from "lucide-react";
 import { apiRequest } from "@/lib/api";
 
 type FieldErrors = Partial<Record<
@@ -173,6 +173,14 @@ return (
         className="relative z-20 w-full overflow-hidden rounded-[38px] border border-white/10 bg-[#040a16] p-8 md:p-10 shadow-[0_50px_120px_rgba(0,0,0,0.45)]"
       >
         <div className="space-y-8">
+          <Link
+            className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 text-sm font-semibold text-slate-300 hover:bg-white/10"
+            href="/login"
+          >
+            <ArrowLeft size={17} />
+            Back to login
+          </Link>
+
           <div>
             <p className="text-xs uppercase tracking-[0.3em] text-slate-400/80 font-medium">
               Account creation

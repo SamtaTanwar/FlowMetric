@@ -1,9 +1,9 @@
 {
-  "name": "employee-workflow-tracking",
+  "name": "flowmetric",
   "version": "0.1.0",
   "private": true,
   "main": "electron.js",
-  "description": "Employee Workflow Tracking Desktop App",
+  "description": "FlowMetric Desktop App",
   "author": "Nandni",
   "scripts": {
     "dev": "next dev",
@@ -17,7 +17,7 @@
   },
   "build": {
     "appId": "com.employee.workflow",
-    "productName": "Employee Workflow Tracking",
+    "productName": "FlowMetric",
     "asar": false,
     "directories": {
       "output": "dist"

@@ -51,6 +51,8 @@ import {
   getStoredUser,
 } from "@/lib/api";
 import type { StoredUser } from "@/lib/api";
+import { SessionUsageTables } from "./session-usage-tables";
+import type { SessionUsageRow } from "./session-usage-tables";
 
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -80,12 +82,6 @@ type EmployeeRow = {
   activeTime?: string;
   idleTime?: string;
   productiveTime?: string;
-};
-
-type ActivityItem = {
-  title: string;
-  time: string;
-  type: string;
 };
 
 type WorkflowItem = {
@@ -136,31 +132,6 @@ type AppUsageRow = {
   durationSeconds: number;
   firstSeenAt: string;
   lastSeenAt: string;
-};
-
-type SessionUsageRow = {
-  sessionId: number;
-  userId: number;
-  employeeCode: string;
-  employeeName: string;
-  department: string;
-  loginAt: string;
-  logoutAt: string | null;
-  sessionStatus: string;
-  sessionLabel: string;
-  totalMinutes: number;
-  idleMinutes: number;
-  breakMinutes: number;
-  activeMinutes: number;
-  productiveMinutes: number;
-  unproductiveMinutes: number;
-  networkInterruptionMinutes: number;
-  appName: string;
-  windowTitle: string;
-  category: string;
-  appDurationSeconds: number;
-  firstSeenAt: string | null;
-  lastSeenAt: string | null;
 };
 
 type ApiEmployee = {
@@ -242,14 +213,6 @@ type ApiLiveEmployee = {
   } | null;
 };
 
-type ApiTrackingEvent = {
-  id: number;
-  sessionId: number;
-  type: string;
-  detail?: string | null;
-  createdAt: string;
-};
-
 type ApiPolicy = {
   allowedIdleMinutes: number;
   breakAllowanceMinutes: number;
@@ -293,9 +256,6 @@ type ApiDailyReport = {
   }>;
   workflowCounts: Array<{ status: string; _count: { status: number } }>;
 };
-
-// Initialize as empty — dashboard should populate from backend APIs only
-const activityFeed: ActivityItem[] = [];
 
 function formatMinutes(minutes = 0) {
   const hours = Math.floor(minutes / 60);
@@ -493,25 +453,6 @@ function adminNotificationsOnly(items: NotificationItem[]) {
   return items.filter((item) => item.userId == null);
 }
 
-function mapTrackingEventToActivityItem(event: ApiTrackingEvent, employeeName: string): ActivityItem {
-  const normalizedType = event.type.replace(/_/g, " ").toLowerCase();
-  const title = event.detail
-    ? `${employeeName}: ${event.detail}`
-    : `${employeeName}: ${normalizedType}`;
-
-  const tone = event.type.includes("END")
-    ? "success"
-    : event.type.includes("START")
-      ? "warning"
-      : "info";
-
-  return {
-    title,
-    time: timeAgo(event.createdAt),
-    type: tone,
-  };
-}
-
 function mapPolicies(policy?: ApiPolicy): PolicyItem[] {
   if (!policy) {
     return [];
@@ -625,7 +566,6 @@ export default function DashboardPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
   const [employeeRows, setEmployeeRows] = useState<EmployeeRow[]>([]);
-  const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [sessionUsageRows, setSessionUsageRows] = useState<SessionUsageRow[]>([]);
   const [workflowItems, setWorkflowItems] = useState<WorkflowItem[]>([]);
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
@@ -709,6 +649,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   }, [selectedEmployee]);
 
   useEffect(() => {
+    let isCurrent = true;
     const storedUser = getStoredUser();
 
     if (!canOpenProtectedRoute("/dashboard")) {
@@ -764,6 +705,10 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage"),
         ]);
 
+        if (!isCurrent) {
+          return;
+        }
+
         setCurrentUser(meResponse.user || storedUser);
         const mappedEmployees = employeesResponse.employees.map(mapEmployee);
         const mappedWorkflows = workflowsResponse.workflows.map(mapWorkflow);
@@ -773,7 +718,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
         const colors = ["#2563eb", "#16a34a", "#f59e0b", "#7c3aed", "#dc2626"];
 
         setEmployeeRows(mappedEmployees);
-        setSelectedEmployee(mappedEmployees[0] ?? null);
+        setSelectedEmployee((current) =>
+          current
+            ? mappedEmployees.find((employee) => employee.id === current.id) ?? current
+            : mappedEmployees[0] ?? null,
+        );
         setProductivityChartData(
           mappedEmployees.map((employee) => ({
             day: employee.name,
@@ -796,40 +745,6 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
         setLeaveRequests(leaveRequestsResponse.requests);
         setLiveEmployees(liveResponse.employees);
 
-        const liveSessionEmployees = liveResponse.employees
-          .filter((employee) => employee.currentSession?.id)
-          .slice(0, 2);
-
-        const liveSessionEvents = await Promise.all(
-          liveSessionEmployees.map((employee) =>
-            apiRequest<{ events: ApiTrackingEvent[] }>(
-              `/api/tracking/events/${employee.currentSession!.id}`,
-            ),
-          ),
-        );
-
-        const eventActivityItems = liveSessionEmployees.flatMap((employee, index) =>
-          liveSessionEvents[index].events.slice(-2).map((event) =>
-            mapTrackingEventToActivityItem(event, employee.name),
-          ),
-        );
-
-        setActivityItems(
-          [
-            ...eventActivityItems,
-            ...mappedNotifications.slice(0, 2).map((item) => ({
-              title: item.title,
-              time: item.time,
-              type: item.tone === "alert" ? "alert" : item.tone,
-            })),
-            ...liveResponse.employees.slice(0, 2).map((employee) => ({
-              title: `${employee.name} is ${employee.liveStatus.toLowerCase()}`,
-              time: employee.currentSession?.loginAt ? timeAgo(employee.currentSession.loginAt) : "Just now",
-              type: employee.liveStatus === "ONLINE" ? "success" : "warning",
-            })),
-          ]
-            .slice(0, 4),
-        );
         setPolicyItems(mapPolicies(policiesResponse.policies[0]));
 
         const departmentCounts = mappedEmployees.reduce<Record<string, number>>((counts, employee) => {
@@ -893,6 +808,12 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     }
 
     loadDashboardData();
+    const refreshInterval = window.setInterval(loadDashboardData, 10000);
+
+    return () => {
+      isCurrent = false;
+      window.clearInterval(refreshInterval);
+    };
   }, [router]);
 
   const filteredEmployees = useMemo(() => {
@@ -1229,12 +1150,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                   </SectionCard>
                 </div>
 
-                <div className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
-                  <EmployeeTable compact onSelect={selectEmployee} rows={filteredEmployees} selectedName={selectedEmployee?.name} />
-                  <ActivityFeed items={activityItems} />
-                </div>
-
-                <SessionUsageTable rows={sessionUsageRows} />
+                <SessionUsageTables rows={sessionUsageRows} />
               </>
             )}
 
@@ -1282,18 +1198,16 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
 }
 
 function EmployeeTable({
-  compact = false,
   onSelect,
   rows = [],
   selectedName,
 }: {
-  compact?: boolean;
   onSelect?: (employee: EmployeeRow) => void;
   rows?: EmployeeRow[];
   selectedName?: string;
 }) {
   return (
-    <SectionCard title={compact ? "Employee Snapshot" : "Employee Directory"}>
+    <SectionCard title="Employee Directory">
       <p className="mb-4 text-sm text-slate-400">
         Click an employee row to open their individual attendance and productivity details.
       </p>
@@ -1311,7 +1225,7 @@ function EmployeeTable({
             </tr>
           </thead>
           <tbody>
-            {rows.slice(0, compact ? 4 : rows.length).map((employee) => (
+            {rows.map((employee) => (
               <tr
                 className={`cursor-pointer border-b border-white/5 last:border-0 hover:bg-cyan-300/5 ${
                   selectedName === employee.name ? "bg-cyan-300/10" : ""
@@ -1368,43 +1282,6 @@ function EmployeeTable({
             )}
           </tbody>
         </table>
-      </div>
-    </SectionCard>
-  );
-}
-
-function ActivityFeed({ items = activityFeed }: { items?: ActivityItem[] }) {
-  return (
-    <SectionCard title="Live Activity Feed">
-      <div className="space-y-4">
-        {items.map((item, index) => {
-          const Icon =
-            item.type === "success"
-              ? CheckCircle2
-              : item.type === "warning"
-                ? Clock3
-                : item.type === "info"
-                  ? Activity
-                  : AlertTriangle;
-          const glassColor =
-            item.type === "success"
-              ? "text-emerald-200 bg-emerald-300/10 ring-1 ring-emerald-300/20"
-              : item.type === "warning"
-                ? "text-amber-200 bg-amber-300/10 ring-1 ring-amber-300/20"
-                : "text-rose-200 bg-rose-300/10 ring-1 ring-rose-300/20";
-
-          return (
-            <div className="flex gap-3" key={`${item.title}-${item.time}-${item.type}-${index}`}>
-              <div className={`flex size-9 shrink-0 items-center justify-center rounded-xl ${glassColor}`}>
-                <Icon size={18} />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-white">{item.title}</p>
-                <p className="mt-1 text-xs text-slate-400">{item.time}</p>
-              </div>
-            </div>
-          );
-        })}
       </div>
     </SectionCard>
   );
@@ -1705,101 +1582,9 @@ function ActivityView({
         </SectionCard>
       </div>
 
-      <SessionUsageTable rows={sessionUsageRows} />
+      <SessionUsageTables rows={sessionUsageRows} />
     </div>
   );
-}
-
-function SessionUsageTable({ rows = [] }: { rows?: SessionUsageRow[] }) {
-  return (
-    <SectionCard title="Clock-In to Clock-Out App Usage">
-      <div className="overflow-x-auto">
-        <table className="min-w-[1320px] text-left text-sm">
-          <thead className="text-xs uppercase text-slate-400">
-            <tr className="border-b border-white/10">
-              <th className="px-3 py-3 font-semibold">Employee</th>
-              <th className="px-3 py-3 font-semibold">Clock In</th>
-              <th className="px-3 py-3 font-semibold">Clock Out</th>
-              <th className="px-3 py-3 font-semibold">Status</th>
-              <th className="px-3 py-3 font-semibold">Total Idle</th>
-              <th className="px-3 py-3 font-semibold">Break</th>
-              <th className="px-3 py-3 font-semibold">Productive</th>
-              <th className="px-3 py-3 font-semibold">Unproductive</th>
-              <th className="px-3 py-3 font-semibold">Network</th>
-              <th className="px-3 py-3 font-semibold">Activity / App / Website</th>
-              <th className="px-3 py-3 font-semibold">Window</th>
-              <th className="px-3 py-3 font-semibold">Type</th>
-              <th className="px-3 py-3 font-semibold">Time</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/10">
-            {rows.length > 0 ? (
-              rows.map((item, index) => (
-                <tr key={`${item.sessionId}-${item.appName}-${item.windowTitle}-${item.category}-${index}`}>
-                  <td className="px-3 py-3">
-                    <p className="font-semibold text-white">{item.employeeName}</p>
-                    <p className="mt-0.5 text-xs text-slate-400">{item.employeeCode}</p>
-                  </td>
-                  <td className="px-3 py-3 text-slate-300">{formatFullDateTime(item.loginAt)}</td>
-                  <td className="px-3 py-3 text-slate-300">
-                    {item.logoutAt ? formatFullDateTime(item.logoutAt) : "Still active"}
-                  </td>
-                  <td className="px-3 py-3">
-                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(item.sessionLabel)}`}>
-                      {item.sessionLabel}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 font-semibold text-amber-100">{formatMinutes(item.idleMinutes)}</td>
-                  <td className="px-3 py-3 font-semibold text-blue-100">{formatMinutes(item.breakMinutes)}</td>
-                  <td className="px-3 py-3 font-semibold text-emerald-100">{formatMinutes(item.productiveMinutes)}</td>
-                  <td className="px-3 py-3 font-semibold text-rose-100">{formatMinutes(item.unproductiveMinutes)}</td>
-                  <td className="px-3 py-3 font-semibold text-violet-100">{formatMinutes(item.networkInterruptionMinutes)}</td>
-                  <td className="max-w-[190px] px-3 py-3 font-medium text-white">
-                    <span className="block truncate">{item.appName}</span>
-                  </td>
-                  <td className="max-w-[260px] px-3 py-3 text-slate-300">
-                    <span className="block truncate">{item.windowTitle}</span>
-                  </td>
-                  <td className="px-3 py-3">
-                    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${usageCategoryStyle(item.category)}`}>
-                      {labelFromEnum(item.category)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 font-semibold text-cyan-100">{formatSeconds(item.appDurationSeconds)}</td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td className="px-3 py-8 text-center text-slate-400" colSpan={13}>
-                  No session usage recorded yet.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </SectionCard>
-  );
-}
-
-function usageCategoryStyle(category: string) {
-  if (category === "UNPRODUCTIVE") {
-    return "bg-rose-300/10 text-rose-200 ring-rose-300/20";
-  }
-
-  if (category === "NETWORK") {
-    return "bg-violet-300/10 text-violet-200 ring-violet-300/20";
-  }
-
-  if (category === "IDLE" || category === "BREAK") {
-    return "bg-amber-300/10 text-amber-200 ring-amber-300/20";
-  }
-
-  if (category === "PRODUCTIVE") {
-    return "bg-emerald-300/10 text-emerald-200 ring-emerald-300/20";
-  }
-
-  return "bg-slate-300/10 text-slate-300 ring-white/10";
 }
 
 function WorkflowView({
