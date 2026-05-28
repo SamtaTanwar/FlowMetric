@@ -69,8 +69,12 @@ export default function SessionUsagePage({ kind }: { kind: TableKind }) {
           return;
         }
 
+        const sessionUsagePath =
+          kind === "app-website-activity"
+            ? "/api/admin/session-usage?todayActiveOnly=true&limit=200"
+            : "/api/admin/session-usage?limit=200";
         const [sessionUsageResponse, employeesResponse] = await Promise.all([
-          apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage?limit=200"),
+          apiRequest<{ rows: SessionUsageRow[] }>(sessionUsagePath),
           kind === "employee-snapshot"
             ? apiRequest<{ employees: ApiEmployee[] }>("/api/employees")
             : Promise.resolve({ employees: [] }),

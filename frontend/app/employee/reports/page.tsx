@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { CalendarDays } from "lucide-react";
 import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser, isEmployeeAccount } from "@/lib/api";
 
 type ProductivityRecord = {
@@ -100,6 +101,26 @@ function formatDate(value?: string | null) {
   });
 }
 
+function dateInputValue(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    timeZone: "Asia/Kolkata",
+  }).formatToParts(value);
+  const getPart = (type: string) => parts.find((part) => part.type === type)?.value || "";
+
+  return `${getPart("year")}-${getPart("month")}-${getPart("day")}`;
+}
+
+function dateKey(value?: string | null) {
+  if (!value) {
+    return "";
+  }
+
+  return dateInputValue(new Date(value));
+}
+
 function formatTime(value?: string | null) {
   if (!value) {
     return "--";
@@ -124,6 +145,14 @@ function labelFromEnum(value: string) {
 function productiveSecondsWithBreakAllowance(totalSeconds: number, idleSeconds: number, breakSeconds: number) {
   const excessBreakSeconds = Math.max(0, breakSeconds - BREAK_ALLOWANCE_SECONDS);
   return Math.max(0, totalSeconds - idleSeconds - excessBreakSeconds);
+}
+
+function productivityPercentFromSeconds(productiveSeconds: number, totalSeconds: number) {
+  if (totalSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.min(100, Math.round((productiveSeconds / totalSeconds) * 100));
 }
 
 function secondsFromEventPairs(
@@ -197,6 +226,8 @@ export default function EmployeeReportsPage() {
   const [breakStartedAt, setBreakStartedAt] = useState<number | null>(null);
   const [idleStartedAt, setIdleStartedAt] = useState<number | null>(null);
   const [currentTimestamp, setCurrentTimestamp] = useState(() => Date.now());
+  const [reportDate, setReportDate] = useState(() => dateInputValue());
+  const [isReportCalendarOpen, setIsReportCalendarOpen] = useState(false);
 
   useEffect(() => {
     const allowEmployeeReturn = () => {
@@ -374,6 +405,53 @@ export default function EmployeeReportsPage() {
     };
   }, [attendanceRecords, records, workflowRecords]);
 
+  const dateReport = useMemo(() => {
+    const liveProductivity =
+      activeSession && dateKey(activeSession.loginAt) === reportDate
+        ? {
+            id: -activeSession.id,
+            date: activeSession.loginAt,
+            activeMinutes: Math.max(
+              0,
+              Math.round((metrics.totalSeconds - metrics.idleSeconds - metrics.breakSeconds) / 60),
+            ),
+            loginMinutes: Math.round(metrics.totalSeconds / 60),
+            productiveMinutes: Math.round(metrics.productiveSeconds / 60),
+            breakMinutes: Math.round(metrics.breakSeconds / 60),
+            idleMinutes: Math.round(metrics.idleSeconds / 60),
+            productivityPercent: productivityPercentFromSeconds(metrics.productiveSeconds, metrics.totalSeconds),
+          }
+        : null;
+    const productivity = [
+      ...records.filter((record) => dateKey(record.date) === reportDate),
+      ...(liveProductivity ? [liveProductivity] : []),
+    ];
+    const attendance = attendanceRecords.filter((record) => dateKey(record.date) === reportDate);
+    const workflows = workflowRecords.filter((workflow) => {
+      return [workflow.updatedAt, workflow.completedAt, workflow.dueDate].some((value) => dateKey(value) === reportDate);
+    });
+    const totalWorkedMinutes = productivity.reduce((sum, record) => sum + record.loginMinutes, 0);
+    const productiveMinutes = productivity.reduce((sum, record) => sum + record.productiveMinutes, 0);
+    const breakMinutes = productivity.reduce((sum, record) => sum + record.breakMinutes, 0);
+    const idleMinutes = productivity.reduce((sum, record) => sum + record.idleMinutes, 0);
+    const averageProductivity = productivity.length
+      ? Math.round(productivity.reduce((sum, record) => sum + record.productivityPercent, 0) / productivity.length)
+      : 0;
+    const completedWorkflows = workflows.filter((workflow) => workflow.status === "COMPLETED").length;
+
+    return {
+      productivity,
+      attendance,
+      workflows,
+      totalWorkedMinutes,
+      productiveMinutes,
+      breakMinutes,
+      idleMinutes,
+      averageProductivity,
+      completedWorkflows,
+    };
+  }, [activeSession, attendanceRecords, metrics, records, reportDate, workflowRecords]);
+
   function csvCell(value: unknown) {
     const text = value == null ? "" : String(value);
     return `"${text.replace(/"/g, '""')}"`;
@@ -413,7 +491,7 @@ export default function EmployeeReportsPage() {
       ),
       "",
       csvRow(["Productivity History"]),
-      csvRow(["Date", "Worked", "Active", "Productive", "Break", "Idle", "Productivity"]),
+      csvRow(["Date", "Worked", "Active", "Productive Time", "Break", "Idle", "Productivity"]),
       ...records.map((record) =>
         csvRow([
           formatDate(record.date),
@@ -447,6 +525,74 @@ export default function EmployeeReportsPage() {
     const link = document.createElement("a");
     link.href = url;
     link.download = `employee-work-report-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleExportDateCsv() {
+    const lines = [
+      csvRow(["Employee Date Wise Work Report"]),
+      csvRow(["Date", formatDate(reportDate)]),
+      csvRow(["Generated At", new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })]),
+      "",
+      csvRow(["Summary"]),
+      csvRow(["Total Worked", formatMinutes(dateReport.totalWorkedMinutes)]),
+      csvRow(["Productive Time", formatMinutes(dateReport.productiveMinutes)]),
+      csvRow(["Break Time", formatMinutes(dateReport.breakMinutes)]),
+      csvRow(["Idle Time", formatMinutes(dateReport.idleMinutes)]),
+      csvRow(["Average Productivity", `${dateReport.averageProductivity}%`]),
+      csvRow(["Attendance Records", dateReport.attendance.length]),
+      csvRow(["Completed Workflows", `${dateReport.completedWorkflows}/${dateReport.workflows.length}`]),
+      "",
+      csvRow(["Attendance"]),
+      csvRow(["Date", "Status", "Clock In", "Clock Out", "Late Minutes", "Overtime Minutes", "Idle Deduction Minutes"]),
+      ...dateReport.attendance.map((record) =>
+        csvRow([
+          formatDate(record.date),
+          labelFromEnum(record.status),
+          formatTime(record.loginAt),
+          formatTime(record.logoutAt),
+          record.lateMinutes,
+          record.overtimeMinutes,
+          record.idleDeductionMinutes,
+        ]),
+      ),
+      "",
+      csvRow(["Productivity"]),
+      csvRow(["Date", "Worked", "Active", "Productive Time", "Break", "Idle", "Productivity"]),
+      ...dateReport.productivity.map((record) =>
+        csvRow([
+          formatDate(record.date),
+          formatMinutes(record.loginMinutes),
+          formatMinutes(record.activeMinutes),
+          formatMinutes(record.productiveMinutes),
+          formatMinutes(record.breakMinutes),
+          formatMinutes(record.idleMinutes),
+          `${Math.round(record.productivityPercent)}%`,
+        ]),
+      ),
+      "",
+      csvRow(["Workflow"]),
+      csvRow(["Title", "Status", "Priority", "Estimated Hours", "Actual Hours", "Due Date", "Completed At", "Last Updated"]),
+      ...dateReport.workflows.map((workflow) =>
+        csvRow([
+          workflow.title,
+          labelFromEnum(workflow.status),
+          labelFromEnum(workflow.priority),
+          workflow.estimatedHours ?? "",
+          workflow.actualHours ?? "",
+          formatDate(workflow.dueDate),
+          formatDate(workflow.completedAt),
+          formatDate(workflow.updatedAt),
+        ]),
+      ),
+    ];
+
+    const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `employee-work-report-${reportDate}.csv`;
     link.click();
     URL.revokeObjectURL(url);
   }
@@ -502,6 +648,14 @@ export default function EmployeeReportsPage() {
     router.push("/employee");
   }
 
+  function handleReportDateChange(date: string) {
+    setReportDate(date);
+    setIsReportCalendarOpen(false);
+    requestAnimationFrame(() => {
+      document.getElementById("date-wise-report")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#050816] text-white">
       <div className="absolute left-[-10%] top-[-10%] h-[500px] w-[500px] rounded-full bg-blue-600/20 blur-3xl" />
@@ -525,12 +679,50 @@ export default function EmployeeReportsPage() {
               </h1>
 
               <div className="flex flex-col gap-3 sm:flex-row">
+                <div className="relative">
+                  <button
+                    aria-label="Select report date"
+                    className="inline-flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-cyan-100 hover:bg-white/10"
+                    onClick={() => setIsReportCalendarOpen((open) => !open)}
+                    type="button"
+                  >
+                    <CalendarDays size={18} />
+                  </button>
+
+                  {isReportCalendarOpen && (
+                    <div className="absolute right-0 z-30 mt-3 w-64 rounded-lg border border-white/10 bg-slate-950 p-4 shadow-2xl shadow-black/40">
+                      <label className="block">
+                        <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                          Report Date
+                        </span>
+                        <input
+                          className="h-10 w-full rounded-lg border border-white/10 bg-slate-900 px-3 text-sm font-semibold text-white outline-none [color-scheme:dark] focus:ring-2 focus:ring-cyan-300/40"
+                          onChange={(event) => handleReportDateChange(event.target.value)}
+                          type="date"
+                          value={reportDate}
+                        />
+                      </label>
+                      <button
+                        className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-cyan-300 px-3 text-sm font-semibold text-slate-950 hover:bg-cyan-200"
+                        onClick={() => {
+                          handleExportDateCsv();
+                          setIsReportCalendarOpen(false);
+                        }}
+                        type="button"
+                      >
+                        <CalendarDays size={16} />
+                        Export Date Report
+                      </button>
+                    </div>
+                  )}
+                </div>
+
                 <button
                   className="inline-flex h-11 items-center justify-center rounded-xl bg-cyan-300 px-4 text-sm font-semibold text-slate-950 hover:bg-cyan-200"
                   onClick={handleExportCsv}
                   type="button"
                 >
-                  Export CSV
+                  Export Full History CSV
                 </button>
                 <button
                   className="inline-flex h-11 items-center justify-center rounded-xl border border-white/10 bg-white/6 px-4 text-sm font-semibold text-slate-200 hover:bg-white/10"
@@ -547,6 +739,63 @@ export default function EmployeeReportsPage() {
             </p>
           </div>
 
+          <div id="date-wise-report" className="mt-8 scroll-mt-8 rounded-lg border border-cyan-300/20 bg-cyan-300/8 p-5 backdrop-blur-2xl">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <p className="text-sm font-semibold uppercase tracking-[0.25em] text-cyan-200">
+                  Date Wise Report
+                </p>
+                <h2 className="mt-2 text-2xl font-semibold text-white">
+                  Productivity, Attendance & Workflow Export
+                </h2>
+              </div>
+
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                <button
+                  className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-white px-4 text-sm font-semibold text-slate-950 hover:bg-cyan-100"
+                  onClick={handleExportDateCsv}
+                  type="button"
+                >
+                  <CalendarDays size={17} />
+                  Export Selected Date
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              {[
+                {
+                  title: "Worked",
+                  value: formatMinutes(dateReport.totalWorkedMinutes),
+                },
+                {
+                  title: "Productive Time",
+                  value: formatMinutes(dateReport.productiveMinutes),
+                },
+                {
+                  title: "Attendance",
+                  value: `${dateReport.attendance.length} record${dateReport.attendance.length === 1 ? "" : "s"}`,
+                },
+                {
+                  title: "Avg Productivity",
+                  value: `${dateReport.averageProductivity}%`,
+                },
+                {
+                  title: "Workflows",
+                  value: `${dateReport.completedWorkflows}/${dateReport.workflows.length}`,
+                },
+              ].map((card) => (
+                <div
+                  className="rounded-lg border border-white/10 bg-slate-950/45 p-4"
+                  key={card.title}
+                >
+                  <p className="text-xs uppercase tracking-[0.18em] text-slate-400">{card.title}</p>
+                  <p className="mt-2 text-lg font-semibold text-white">{card.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <div className="mt-12 grid gap-6 md:grid-cols-3 xl:grid-cols-6">
             {[
               {
@@ -560,7 +809,7 @@ export default function EmployeeReportsPage() {
                 color: "from-emerald-400 to-green-500",
               },
               {
-                title: "Productive",
+                title: "Productive Time",
                 value: formatMinutes(allTimeMetrics.productiveMinutes),
                 color: "from-yellow-400 to-orange-500",
               },
@@ -639,7 +888,7 @@ export default function EmployeeReportsPage() {
                     <tr className="border-b border-white/10">
                       <th className="py-3 pr-4">Date</th>
                       <th className="px-4 py-3">Worked</th>
-                      <th className="px-4 py-3">Productive</th>
+                      <th className="px-4 py-3">Productive Time</th>
                       <th className="px-4 py-3">Idle</th>
                       <th className="py-3 pl-4">Score</th>
                     </tr>

@@ -741,6 +741,7 @@ export default function DashboardPage() {
   const [reportDate, setReportDate] = useState("");
   const [attendanceDate, setAttendanceDate] = useState(formatDateParam());
   const [activityDate, setActivityDate] = useState(formatDateParam());
+  const [screenshotDate, setScreenshotDate] = useState("");
   const [isReportCalendarOpen, setIsReportCalendarOpen] = useState(false);
   const effectiveAttendanceDate = attendanceDate || formatDateParam();
 
@@ -767,21 +768,23 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     presentCount: 0,
     totalRecorded: 0,
   });
-  const headerDateTab = ["reports", "attendance", "activity"].includes(activeTab) ? activeTab : "";
+  const headerDateTab = ["reports", "attendance", "activity", "screenshots"].includes(activeTab) ? activeTab : "";
   const headerDateValue =
-    headerDateTab === "reports" ? reportDate : headerDateTab === "attendance" ? effectiveAttendanceDate : activityDate;
-  const headerDateLabel =
     headerDateTab === "reports"
       ? reportDate
-        ? formatDateInputDisplay(reportDate)
-        : "All dates"
-      : formatDateInputDisplay(headerDateValue);
+      : headerDateTab === "attendance"
+        ? effectiveAttendanceDate
+        : headerDateTab === "screenshots"
+          ? screenshotDate
+          : activityDate;
   const headerDateTitle =
     headerDateTab === "reports"
       ? "Select report date"
       : headerDateTab === "attendance"
         ? "Select attendance date"
-        : "Select activity date";
+        : headerDateTab === "screenshots"
+          ? "Select screenshot date"
+          : "Select activity date";
 
   function setHeaderDate(value: string) {
     if (headerDateTab === "reports") {
@@ -796,6 +799,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
 
     if (headerDateTab === "activity") {
       setActivityDate(value || formatDateParam());
+      return;
+    }
+
+    if (headerDateTab === "screenshots") {
+      setScreenshotDate(value);
     }
   }
 
@@ -1223,12 +1231,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                   <div className="relative">
                     <button
                       aria-label={headerDateTitle}
-                      className="flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 text-sm font-semibold text-cyan-100 hover:bg-white/10"
+                      className="flex size-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-cyan-100 hover:bg-white/10"
                       onClick={() => setIsReportCalendarOpen((open) => !open)}
                       type="button"
                     >
                       <CalendarDays size={18} />
-                      <span>{headerDateLabel}</span>
                     </button>
                     {isReportCalendarOpen && (
                       <div className="absolute left-0 z-30 mt-3 w-64 rounded-2xl border border-white/10 bg-slate-950 p-4 shadow-2xl shadow-black/40">
@@ -1243,12 +1250,12 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                         <button
                           className="mt-3 w-full rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
                           onClick={() => {
-                            setHeaderDate(headerDateTab === "reports" ? "" : formatDateParam());
+                            setHeaderDate(headerDateTab === "reports" || headerDateTab === "screenshots" ? "" : formatDateParam());
                             setIsReportCalendarOpen(false);
                           }}
                           type="button"
                         >
-                          {headerDateTab === "reports" ? "Show All Dates" : "Show Today"}
+                          {headerDateTab === "reports" || headerDateTab === "screenshots" ? "Clear" : "Today"}
                         </button>
                       </div>
                     )}
@@ -1467,7 +1474,13 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               />
             )}
             {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
-            {activeTab === "screenshots" && <ScreenshotsView rows={employeeRows} />}
+            {activeTab === "screenshots" && (
+              <ScreenshotsView
+                onSelectedDateChange={setScreenshotDate}
+                rows={employeeRows}
+                selectedDate={screenshotDate}
+              />
+            )}
             {activeTab === "notifications" && (
               <NotificationView
                 items={notificationItems}
@@ -2203,10 +2216,17 @@ function ActivityView({
   );
 }
 
-function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
+function ScreenshotsView({
+  onSelectedDateChange,
+  rows = [],
+  selectedDate,
+}: {
+  onSelectedDateChange: (date: string) => void;
+  rows?: EmployeeRow[];
+  selectedDate: string;
+}) {
   const [screenshots, setScreenshots] = useState<EmployeeScreenshot[]>([]);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState("");
-  const [selectedDate, setSelectedDate] = useState("");
   const [showIdleOnly, setShowIdleOnly] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const idleBorderLabel = "Idle > 5 min";
@@ -2282,24 +2302,6 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
             </select>
           </div>
 
-          <div>
-            <label className="text-xs font-semibold uppercase text-slate-400">Capture date</label>
-            <div className="relative mt-2 flex h-12 items-center gap-3 rounded-xl border border-white/10 bg-white/6 px-4 text-white">
-              <CalendarDays size={18} className="shrink-0 text-cyan-200" />
-              <span className="min-w-0 flex-1 text-sm font-semibold">
-                {selectedDate ? formatDateInputDisplay(selectedDate) : "All recent"}
-              </span>
-              <CalendarCheck size={17} className="shrink-0 text-slate-300" />
-              <input
-                aria-label="Select capture date"
-                className="absolute inset-0 cursor-pointer opacity-0 [color-scheme:dark]"
-                onChange={(event) => setSelectedDate(event.target.value)}
-                type="date"
-                value={selectedDate}
-              />
-            </div>
-          </div>
-
           <button
             className={`flex w-full items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold ${
               showIdleOnly
@@ -2317,7 +2319,7 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
             className="w-full rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-2.5 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
             onClick={() => {
               setSelectedEmployeeId("");
-              setSelectedDate("");
+              onSelectedDateChange("");
               setShowIdleOnly(false);
             }}
             type="button"

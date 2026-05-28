@@ -333,15 +333,19 @@ function scheduleNextScreenshotFrom(fromMs = Date.now()) {
     return;
   }
 
-  setNextScreenshotDueAt(fromMs + trackerState.screenshotIntervalMs);
-}
+  const dueAtMs = fromMs + trackerState.screenshotIntervalMs;
+  const delayMs = Math.max(1_000, dueAtMs - Date.now());
 
-async function runScheduledScreenshotCheck() {
-  if (!trackerState || trackerState.isScreenshotInFlight) {
-    return;
+  if (trackerState.screenshotInterval) {
+    clearTimeout(trackerState.screenshotInterval);
   }
 
-  if (!trackerState.nextScreenshotDueAtMs || Date.now() < trackerState.nextScreenshotDueAtMs) {
+  setNextScreenshotDueAt(dueAtMs);
+  trackerState.screenshotInterval = setTimeout(sendScheduledScreenshot, delayMs);
+}
+
+async function sendScheduledScreenshot() {
+  if (!trackerState || trackerState.isScreenshotInFlight) {
     return;
   }
 
@@ -459,7 +463,7 @@ async function stopTracker() {
   }
 
   clearInterval(trackerState.interval);
-  clearInterval(trackerState.screenshotMonitorInterval);
+  clearTimeout(trackerState.screenshotInterval);
 
   if (trackerState.currentUsage) {
     const durationSeconds =
@@ -484,7 +488,7 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
     currentUsage: null,
     lastSeenAt: Date.now(),
     pendingSeconds: 0,
-    screenshotMonitorInterval: null,
+    screenshotInterval: null,
     isScreenshotInFlight: false,
     nextScreenshotDueAtMs: null,
     screenshotIntervalMs: Math.max(
@@ -511,7 +515,6 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
   await sendScreenshot();
   trackerState.interval = setInterval(sampleForegroundWindow, 5000);
   scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
-  trackerState.screenshotMonitorInterval = setInterval(runScheduledScreenshotCheck, 5000);
 
   return { ok: true, status: trackerStatus };
 });
@@ -521,6 +524,9 @@ ipcMain.handle("desktop-tracker:status", () => trackerStatus);
 ipcMain.handle("desktop-tracker:capture-now", async () => {
   await sampleForegroundWindow();
   await sendScreenshot();
+  if (trackerState && lastScreenshotCapture.sessionId === trackerState.sessionId) {
+    scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
+  }
   return trackerStatus;
 });
 

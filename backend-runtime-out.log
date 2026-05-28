@@ -2,4 +2,5 @@
 > backend@1.0.0 dev
 > ts-node --transpile-only src/server.ts
 
-◇ injected env (0) from .env // tip: ⌘ override existing { override: true }
+◇ injected env (0) from .env // tip: ⌘ enable debugging { debug: true }
+Server running on port 5000
