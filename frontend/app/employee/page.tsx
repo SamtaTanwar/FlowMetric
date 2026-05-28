@@ -71,6 +71,8 @@ declare global {
 }
 
 const BREAK_ALLOWANCE_SECONDS = 45 * 60;
+const SCREENSHOT_INTERVAL_MINUTES = 10;
+const SCREENSHOT_IDLE_THRESHOLD_MINUTES = 5;
 
 type DesktopTrackerStatus = {
   isRunning: boolean;
@@ -249,7 +251,7 @@ useEffect(() => {
 }, [isAuthorized]);
 
 useEffect(() => {
-  if (!isTracking || !sessionId) {
+  if (!isTracking || !sessionId || isOnBreak) {
     return;
   }
 
@@ -257,17 +259,11 @@ useEffect(() => {
     apiBaseUrl: API_BASE_URL,
     token: getStoredToken(),
     sessionId,
-    screenshotIntervalMinutes: 10,
-    idleThresholdMinutes: 5,
+    screenshotIntervalMinutes: SCREENSHOT_INTERVAL_MINUTES,
+    idleThresholdMinutes: SCREENSHOT_IDLE_THRESHOLD_MINUTES,
   })
     .then((result) => {
       setTrackerStatus(result.status ?? null);
-      return window.desktopTracker?.captureNow();
-    })
-    .then((status) => {
-      if (status) {
-        setTrackerStatus(status);
-      }
     })
     .catch((error) => {
       setTrackerStatus({
@@ -290,7 +286,7 @@ useEffect(() => {
     window.clearInterval(statusInterval);
     window.desktopTracker?.stop().catch(() => null);
   };
-}, [isTracking, sessionId]);
+}, [isTracking, sessionId, isOnBreak]);
 
 useEffect(() => {
   if (!isTracking || !sessionId) {
@@ -345,7 +341,7 @@ useEffect(() => {
 }, [isTracking, sessionId]);
 
 useEffect(() => {
-  if (!isTracking || !sessionId || window.desktopTracker) {
+  if (!isTracking || !sessionId || isOnBreak || window.desktopTracker) {
     return;
   }
 
@@ -377,7 +373,7 @@ useEffect(() => {
   return () => {
     window.clearInterval(browserActivityInterval);
   };
-}, [isTracking, sessionId]);
+}, [isTracking, sessionId, isOnBreak]);
 
   useEffect(() => {
   if (!isTracking || isOnBreak) return;
@@ -765,35 +761,6 @@ if (!isAuthorized) {
               </h2>
             </div>
           </div>
-
-          {isTracking && hasDesktopTracker && (
-            <div className="mt-5 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <p className="font-semibold text-white">
-                  App tracker: {trackerStatus?.isRunning ? "Running" : "Starting"}
-                </p>
-                <button
-                  className="rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-xs font-semibold text-cyan-100 hover:bg-cyan-300/15"
-                  onClick={() => window.desktopTracker?.captureNow().then(setTrackerStatus)}
-                  type="button"
-                >
-                  Capture now
-                </button>
-              </div>
-              <p className="mt-2">
-                Last app: {trackerStatus?.lastUsage
-                  ? `${trackerStatus.lastUsage.appName} - ${trackerStatus.lastUsage.windowTitle}`
-                  : "Waiting for active window"}
-              </p>
-              <p className="mt-1">
-                Backend: {trackerStatus?.lastResponseStatus ?? "--"}
-                {trackerStatus?.lastSentAt ? ` at ${new Date(trackerStatus.lastSentAt).toLocaleTimeString("en-IN")}` : ""}
-              </p>
-              {trackerStatus?.lastError && (
-                <p className="mt-1 text-amber-200">{trackerStatus.lastError}</p>
-              )}
-            </div>
-          )}
 
                            {/* Action Panel */}
           <div

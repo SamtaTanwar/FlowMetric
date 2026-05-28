@@ -64,7 +64,6 @@ const navItems = [
   { id: "activity", label: "Activity", icon: Activity },
   { id: "workflow", label: "Workflows", icon: ListChecks },
   { id: "screenshots", label: "Screenshots", icon: Image },
-  { id: "notifications", label: "Notifications", icon: Bell },
   { id: "reports", label: "Reports", icon: FileText },
   { id: "settings", label: "Settings", icon: Settings },
 ];
@@ -407,6 +406,16 @@ function formatDateParam(value = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function formatDateInputDisplay(value: string) {
+  const [year, month, day] = value.split("-");
+
+  if (!year || !month || !day) {
+    return "--";
+  }
+
+  return `${day}-${month}-${year}`;
+}
+
 function formatMonthParam(value = new Date()) {
   const year = value.getFullYear();
   const month = String(value.getMonth() + 1).padStart(2, "0");
@@ -707,6 +716,7 @@ export default function DashboardPage() {
   const [currentUser, setCurrentUser] = useState<StoredUser | null>(null);
   const [employeeRows, setEmployeeRows] = useState<EmployeeRow[]>([]);
   const [sessionUsageRows, setSessionUsageRows] = useState<SessionUsageRow[]>([]);
+  const [currentLoginAppUsageRows, setCurrentLoginAppUsageRows] = useState<SessionUsageRow[]>([]);
   const [workflowItems, setWorkflowItems] = useState<WorkflowItem[]>([]);
   const [notificationItems, setNotificationItems] = useState<NotificationItem[]>([]);
   const [leaveRequests, setLeaveRequests] = useState<ApiLeaveRequest[]>([]);
@@ -728,6 +738,11 @@ export default function DashboardPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedEmployee, setSelectedEmployee] = useState<EmployeeRow | null>(null);
   const [selectedWorkdayDate, setSelectedWorkdayDate] = useState(formatDateParam());
+  const [reportDate, setReportDate] = useState("");
+  const [attendanceDate, setAttendanceDate] = useState(formatDateParam());
+  const [activityDate, setActivityDate] = useState(formatDateParam());
+  const [isReportCalendarOpen, setIsReportCalendarOpen] = useState(false);
+  const effectiveAttendanceDate = attendanceDate || formatDateParam();
 
 const [workdayStats, setWorkdayStats] = useState<WorkdayStats | null>(null);
 const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
@@ -752,6 +767,37 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     presentCount: 0,
     totalRecorded: 0,
   });
+  const headerDateTab = ["reports", "attendance", "activity"].includes(activeTab) ? activeTab : "";
+  const headerDateValue =
+    headerDateTab === "reports" ? reportDate : headerDateTab === "attendance" ? effectiveAttendanceDate : activityDate;
+  const headerDateLabel =
+    headerDateTab === "reports"
+      ? reportDate
+        ? formatDateInputDisplay(reportDate)
+        : "All dates"
+      : formatDateInputDisplay(headerDateValue);
+  const headerDateTitle =
+    headerDateTab === "reports"
+      ? "Select report date"
+      : headerDateTab === "attendance"
+        ? "Select attendance date"
+        : "Select activity date";
+
+  function setHeaderDate(value: string) {
+    if (headerDateTab === "reports") {
+      setReportDate(value);
+      return;
+    }
+
+    if (headerDateTab === "attendance") {
+      setAttendanceDate(value || formatDateParam());
+      return;
+    }
+
+    if (headerDateTab === "activity") {
+      setActivityDate(value || formatDateParam());
+    }
+  }
 
   useEffect(() => {
     let isCurrent = true;
@@ -826,6 +872,8 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           dashboardStatsResponse,
           reportResponse,
           sessionUsageResponse,
+          currentLoginAppUsageResponse,
+          attendanceResponse,
         ] = await Promise.all([
           apiRequest<{ employees: ApiEmployee[] }>("/api/employees"),
           apiRequest<{ workflows: ApiWorkflow[] }>("/api/workflows"),
@@ -844,7 +892,9 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   totalRecorded: number;
 }>("/api/admin/dashboard-stats"),
           apiRequest<ApiDailyReport>("/api/reports/daily"),
-          apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage"),
+          apiRequest<{ rows: SessionUsageRow[] }>(`/api/admin/session-usage?since=${encodeURIComponent(activityDate)}&limit=200`),
+          apiRequest<{ rows: SessionUsageRow[] }>("/api/admin/session-usage?todayActiveOnly=true&limit=200"),
+          apiRequest<{ records: ApiAttendanceRecord[] }>(`/api/attendance?date=${encodeURIComponent(effectiveAttendanceDate)}&all=true`),
         ]);
         const allTimeReportResponse = await apiRequest<ApiAllTimeReportSummary>(
           "/api/reports/all-time-summary",
@@ -891,10 +941,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
             mouse: minutesFromLabel(employee.idleTime),
           })),
         );
-        setAttendanceRecords(reportResponse.attendance);
+        setAttendanceRecords(attendanceResponse.records || reportResponse.attendance);
         setWorkflowItems(mappedWorkflows);
         setNotificationItems(mappedNotifications);
         setSessionUsageRows(sessionUsageResponse.rows || []);
+        setCurrentLoginAppUsageRows(currentLoginAppUsageResponse.rows || []);
         setLeaveRequests(leaveRequestsResponse.requests);
         setLiveEmployees(liveResponse.employees);
 
@@ -913,7 +964,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
           })),
         );
 
-        const reportDate = allTimeReportResponse.firstLoginAt
+        const allTimeReportDate = allTimeReportResponse.firstLoginAt
           ? `${formatDate(allTimeReportResponse.firstLoginAt)} to now`
           : "First login to now";
         setDashboardStats({
@@ -932,19 +983,19 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
             title: "Productivity History",
             owner: `${allTimeReportResponse.productivityRecords} records - Avg ${allTimeReportResponse.averageProductivity}%`,
             status: allTimeReportResponse.productivityRecords > 0 ? "Updated" : "Pending",
-            date: reportDate,
+            date: allTimeReportDate,
           },
           {
             title: "Attendance Record",
             owner: `${allTimeReportResponse.attendanceRecords} records`,
             status: allTimeReportResponse.attendanceRecords > 0 ? "Updated" : "Pending",
-            date: reportDate,
+            date: allTimeReportDate,
           },
           {
             title: "Workflow Efficiency Report",
             owner: `${allTimeReportResponse.completedWorkflows}/${allTimeReportResponse.workflows} completed - ${allTimeReportResponse.workflowStatusGroups} status groups`,
             status: allTimeReportResponse.workflows > 0 ? "Updated" : "Pending",
-            date: reportDate,
+            date: allTimeReportDate,
           },
         ]);
         setIsAuthorized(true);
@@ -976,7 +1027,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
       isCurrent = false;
       window.clearInterval(refreshInterval);
     };
-  }, [router]);
+  }, [activityDate, effectiveAttendanceDate, router]);
 
   const filteredEmployees = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -995,11 +1046,26 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   function selectEmployee(employee: EmployeeRow) {
     setSelectedEmployee(employee);
     setActiveTab("employee");
-    setSearchQuery(employee.name);
+    setSearchQuery("");
     setSelectedWorkdayDate(formatDateParam());
   }
 
+  function openTab(tabId: string) {
+    setActiveTab(tabId);
+    setSearchQuery("");
+    setIsReportCalendarOpen(false);
+
+    if (tabId === "employees") {
+      setSelectedEmployee(null);
+      setSelectedWorkdayDate(formatDateParam());
+    }
+  }
+
   function handleSearchSubmit() {
+    if (activeTab === "reports") {
+      return;
+    }
+
     const match = filteredEmployees[0];
 
     if (match) {
@@ -1062,7 +1128,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
       <div className="relative z-10 flex h-screen">
         <aside className={`${
   sidebarOpen ? "w-72" : "w-20"
-} sticky top-0 hidden h-screen shrink-0 border-r border-white/10 bg-white/5 px-5 py-6 shadow-2xl shadow-black/20 backdrop-blur-2xl transition-all duration-300 lg:block`} >
+} sticky top-0 hidden h-screen shrink-0 border-r border-white/10 bg-white/5 px-5 py-6 shadow-2xl shadow-black/20 backdrop-blur-2xl transition-all duration-300 md:block`} >
        <div className="flex items-center justify-between">
 <div className="flex items-center justify-between">
   <div className="flex items-center gap-3">
@@ -1108,7 +1174,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     ? "bg-cyan-300/10 text-cyan-100 ring-1 ring-cyan-300/20"
     : "text-slate-400 hover:bg-white/7 hover:text-white"
 }`}
-                  onClick={() => setActiveTab(item.id)}
+                  onClick={() => openTab(item.id)}
                   type="button"
                 >
                   <Icon size={18} />
@@ -1153,6 +1219,41 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               </div>
 
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                {headerDateTab && (
+                  <div className="relative">
+                    <button
+                      aria-label={headerDateTitle}
+                      className="flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 text-sm font-semibold text-cyan-100 hover:bg-white/10"
+                      onClick={() => setIsReportCalendarOpen((open) => !open)}
+                      type="button"
+                    >
+                      <CalendarDays size={18} />
+                      <span>{headerDateLabel}</span>
+                    </button>
+                    {isReportCalendarOpen && (
+                      <div className="absolute left-0 z-30 mt-3 w-64 rounded-2xl border border-white/10 bg-slate-950 p-4 shadow-2xl shadow-black/40">
+                        <label>
+                          <input
+                            className="h-10 w-full rounded-xl border border-white/10 bg-slate-900 px-3 text-sm text-white [color-scheme:dark]"
+                            onChange={(event) => setHeaderDate(event.target.value)}
+                            type="date"
+                            value={headerDateValue}
+                          />
+                        </label>
+                        <button
+                          className="mt-3 w-full rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
+                          onClick={() => {
+                            setHeaderDate(headerDateTab === "reports" ? "" : formatDateParam());
+                            setIsReportCalendarOpen(false);
+                          }}
+                          type="button"
+                        >
+                          {headerDateTab === "reports" ? "Show All Dates" : "Show Today"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex h-10 min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 sm:w-80">
                   <Search size={18} className="shrink-0 text-slate-400" />
                   <input
@@ -1163,7 +1264,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                         handleSearchSubmit();
                       }
                     }}
-                    placeholder="Search employee name or ID"
+                    placeholder="Search employee name, ID, or department"
                     type="text"
                     value={searchQuery}
                   />
@@ -1179,7 +1280,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                 )}
                 <button
                   className="flex size-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-slate-300 hover:bg-white/10"
-                  onClick={() => setActiveTab("notifications")}
+                  onClick={() => openTab("notifications")}
                   type="button"
                 >
                   <Bell size={18} />
@@ -1195,7 +1296,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               </div>
             </div>
 
-            <div className="mt-4 flex gap-2 overflow-x-auto lg:hidden">
+            <div className="mt-4 flex gap-2 overflow-x-auto md:hidden">
               {navItems.map((item) => (
                 <button
                   key={item.id}
@@ -1204,7 +1305,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                       ? "bg-cyan-300/10 text-cyan-100 ring-1 ring-cyan-300/20"
                       : "bg-white/6 text-slate-300"
                   }`}
-                  onClick={() => setActiveTab(item.id)}
+                  onClick={() => openTab(item.id)}
                   type="button"
                 >
                   {item.label}
@@ -1325,7 +1426,10 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                   </SectionCard>
                 </div>
 
-                <SessionUsageTables rows={sessionUsageRows} />
+                <SessionUsageTables
+                  appWebsiteRows={currentLoginAppUsageRows}
+                  rows={sessionUsageRows}
+                />
               </>
             )}
 
@@ -1343,9 +1447,24 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               workdayStats={workdayStats}
             />
             )}
-            {activeTab === "attendance" && <AttendanceView records={attendanceRecords} rows={employeeRows} />}
+            {activeTab === "attendance" && (
+              <AttendanceView
+                chartRows={employeeRows}
+                records={attendanceRecords}
+                searchQuery={searchQuery}
+                selectedDate={effectiveAttendanceDate}
+                tableRows={filteredEmployees}
+              />
+            )}
             {activeTab === "activity" && (
-              <ActivityView chartData={activityChartData} rows={employeeRows} sessionUsageRows={sessionUsageRows} />
+              <ActivityView
+                chartData={activityChartData}
+                currentLoginAppUsageRows={currentLoginAppUsageRows}
+                rows={employeeRows}
+                searchQuery={searchQuery}
+                selectedDate={activityDate}
+                sessionUsageRows={sessionUsageRows}
+              />
             )}
             {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
             {activeTab === "screenshots" && <ScreenshotsView rows={employeeRows} />}
@@ -1364,6 +1483,8 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                   employees={employeeRows}
                   exporting={isExporting}
                   onExport={handleExportReport}
+                  reportDate={reportDate}
+                  searchQuery={searchQuery}
                   workflows={workflowItems}
                 />
               </div>
@@ -1416,8 +1537,7 @@ function EmployeeTable({
               <th className="px-4 py-3">Status</th>
               <th className="px-4 py-3">Attendance</th>
               <th className="px-4 py-3">Productivity</th>
-              <th className="px-4 py-3">Focus Time</th>
-              <th className="py-3 pl-4">Tasks</th>
+              <th className="py-3 pl-4">Focus Time</th>
             </tr>
           </thead>
           <tbody>
@@ -1465,13 +1585,12 @@ function EmployeeTable({
                     <span className="font-medium text-slate-200">{employee.productivityLabel}</span>
                   </div>
                 </td>
-                <td className="px-4 py-4 text-slate-300">{employee.focus}</td>
-                <td className="py-4 pl-4 font-medium text-slate-200">{employee.tasks}</td>
+                <td className="py-4 pl-4 text-slate-300">{employee.focus}</td>
               </tr>
             ))}
             {visibleRows.length === 0 && (
               <tr>
-                <td className="py-8 text-center text-sm text-slate-400" colSpan={7}>
+                <td className="py-8 text-center text-sm text-slate-400" colSpan={6}>
                   No employee found for this search.
                 </td>
               </tr>
@@ -1794,32 +1913,56 @@ function shiftMonth(offset: number) {
 }
 
 function AttendanceView({
+  chartRows = [],
   records = [],
-  rows = [],
+  searchQuery = "",
+  selectedDate,
+  tableRows = [],
 }: {
+  chartRows?: EmployeeRow[];
   records?: ApiAttendanceRecord[];
-  rows?: EmployeeRow[];
+  searchQuery?: string;
+  selectedDate: string;
+  tableRows?: EmployeeRow[];
 }) {
-  const attendanceChartData = rows.map((employee) => ({
-    day: employee.name,
-    attendance: employee.attendance === "Late"
-      ? 70
-      : employee.attendance === "Present"
-        ? 100
-        : employee.attendance === "Half Day"
-          ? 50
-          : employee.attendance === "Absent"
-            ? 20
-            : 0,
-  }));
-
+  const normalizedSearch = searchQuery.trim().toLowerCase();
   const recordByEmployeeCode = new Map(records.map((record) => [record.user.employeeCode, record]));
+  const employeeMatchesSearch = (employee: EmployeeRow) => {
+    if (!normalizedSearch) {
+      return true;
+    }
+
+    return [employee.name, employee.employeeCode, employee.department, employee.role]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(normalizedSearch));
+  };
+  const attendanceStatusForEmployee = (employee: EmployeeRow) => {
+    const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
+    return record?.status || "ABSENT";
+  };
+  const attendanceChartData = chartRows.map((employee) => {
+    const status = attendanceStatusForEmployee(employee);
+    const isHighlighted = employeeMatchesSearch(employee);
+    const attendance = status === "LATE"
+      ? 70
+      : status === "PRESENT"
+        ? 100
+        : status === "HALF_DAY"
+          ? 50
+          : 0;
+
+    return {
+      day: employee.name,
+      attendance: normalizedSearch && !isHighlighted ? 0 : attendance,
+      isHighlighted,
+    };
+  });
 
   return (
     <div className="space-y-6">
       <SectionCard title="Team Attendance Overview">
         <p className="mb-4 text-sm text-slate-400">
-          This chart uses today&apos;s employee attendance state from the dashboard API.
+          Showing attendance for {formatDateInputDisplay(selectedDate)}.
         </p>
         <div className="h-80">
           <ResponsiveContainer height="100%" width="100%">
@@ -1833,6 +1976,12 @@ function AttendanceView({
                 labelStyle={chartTooltipTextStyle}
               />
               <Bar dataKey="attendance" fill="#34d399" name="Attendance %" radius={[6, 6, 0, 0]}>
+                {attendanceChartData.map((item) => (
+                  <Cell
+                    fill={normalizedSearch ? (item.isHighlighted ? "#34d399" : "#334155") : "#34d399"}
+                    key={item.day}
+                  />
+                ))}
                 <LabelList
                   className="fill-slate-200 text-xs font-semibold"
                   formatter={formatPercentValue}
@@ -1858,20 +2007,20 @@ function AttendanceView({
               </tr>
             </thead>
             <tbody className="divide-y divide-white/10">
-              {rows.length > 0 ? (
-                rows.map((employee) => {
+              {tableRows.length > 0 ? (
+                tableRows.map((employee) => {
                   const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
-                  const status = record?.status || employee.attendance.toUpperCase().replace(/\s+/g, "_");
-                  const isLateLogin = status === "LATE" || (record?.lateMinutes ?? 0) > 0 || employee.attendance === "Late";
-                  const loginTime = record?.loginAt ? formatDateTime(record.loginAt) : employee.loginTime || "--";
-                  const logoutTime = record?.logoutAt ? formatDateTime(record.logoutAt) : employee.logoutTime || "--";
+                  const status = record?.status || "ABSENT";
+                  const isLateLogin = status === "LATE" || (record?.lateMinutes ?? 0) > 0;
+                  const loginTime = record?.loginAt ? formatDateTime(record.loginAt) : "--";
+                  const logoutTime = record?.logoutAt ? formatDateTime(record.logoutAt) : "--";
                   const hasLoggedIn = loginTime !== "--" && loginTime !== "Not started";
                   const hasLoggedOut = logoutTime !== "--" && logoutTime !== "Not started";
                   const isEarlyHalfDayLogout = hasLoggedOut && (employee.workedMinutes ?? Number.POSITIVE_INFINITY) < HALF_DAY_WORK_MINUTES;
-                  const isHalfDay = status === "HALF_DAY" || employee.attendance === "Half Day" || isLateLogin || isEarlyHalfDayLogout;
+                  const isHalfDay = status === "HALF_DAY" || isLateLogin || isEarlyHalfDayLogout;
                   const isPresent =
                     (hasLoggedIn && !hasLoggedOut) ||
-                    ((status === "PRESENT" || employee.attendance === "Present") && !isHalfDay);
+                    (status === "PRESENT" && !isHalfDay);
                   const lateMinutes = record?.lateMinutes ?? 0;
                   const halfDayTime = isEarlyHalfDayLogout && hasLoggedOut ? logoutTime : loginTime;
                   const halfDayReason = isEarlyHalfDayLogout
@@ -1928,26 +2077,80 @@ function AttendanceView({
 
 function ActivityView({
   chartData = [],
+  currentLoginAppUsageRows = [],
   rows = [],
+  searchQuery = "",
+  selectedDate,
   sessionUsageRows = [],
 }: {
   chartData?: Array<{ hour: string; keyboard: number; mouse: number }>;
+  currentLoginAppUsageRows?: SessionUsageRow[];
   rows?: EmployeeRow[];
+  searchQuery?: string;
+  selectedDate: string;
   sessionUsageRows?: SessionUsageRow[];
 }) {
-  const activeSessions = rows.filter((employee) => employee.status === "Active").length;
-  const idleMinutes = rows.reduce((sum, employee) => sum + minutesFromLabel(employee.idleTime), 0);
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const employeeMatchesSearch = (employee: Pick<EmployeeRow, "name" | "employeeCode" | "department" | "role">) => {
+    if (!normalizedSearch) {
+      return true;
+    }
+
+    return [employee.name, employee.employeeCode, employee.department, employee.role]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(normalizedSearch));
+  };
+  const sessionRowMatchesSearch = (row: SessionUsageRow) => {
+    if (!normalizedSearch) {
+      return true;
+    }
+
+    return [row.employeeName, row.employeeCode, row.department, row.appName, row.windowTitle]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(normalizedSearch));
+  };
+  const selectedSessionRows = sessionUsageRows.filter((row) => {
+    const loginDate = row.loginAt ? formatDateParam(new Date(row.loginAt)) : "";
+    const logoutDate = row.logoutAt ? formatDateParam(new Date(row.logoutAt)) : "";
+    return loginDate === selectedDate || logoutDate === selectedDate;
+  });
+  const visibleSessionRows = selectedSessionRows.filter(sessionRowMatchesSearch);
+  const visibleCurrentLoginAppRows = currentLoginAppUsageRows.filter(sessionRowMatchesSearch);
+  const activityByUser = selectedSessionRows.reduce((map, row) => {
+    const current = map.get(row.userId) || { keyboard: 0, mouse: 0 };
+    current.keyboard += row.productiveMinutes || 0;
+    current.mouse += row.idleMinutes || 0;
+    map.set(row.userId, current);
+    return map;
+  }, new Map<number, { keyboard: number; mouse: number }>());
+  const fallbackActivityByName = new Map(chartData.map((item) => [item.hour, item]));
+  const chartRows = rows.map((employee) => {
+    const activity = typeof employee.id === "number"
+      ? activityByUser.get(employee.id)
+      : fallbackActivityByName.get(employee.name);
+    const isHighlighted = employeeMatchesSearch(employee);
+
+    return {
+      hour: employee.name,
+      keyboard: normalizedSearch && !isHighlighted ? 0 : activity?.keyboard ?? 0,
+      mouse: normalizedSearch && !isHighlighted ? 0 : activity?.mouse ?? 0,
+      isHighlighted,
+    };
+  });
+  const activeSessions = visibleSessionRows.filter((row) => row.sessionStatus === "ACTIVE").length;
+  const trackedEmployees = new Set(visibleSessionRows.map((row) => row.userId)).size || (normalizedSearch ? 0 : rows.length);
+  const idleMinutes = visibleSessionRows.reduce((sum, row) => sum + row.idleMinutes, 0);
 
   return (
     <div className="space-y-6">
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
         <SectionCard title="Recorded Activity Signals">
           <p className="mb-4 text-sm text-slate-400">
-            This chart uses each employee&apos;s tracked productive and idle minutes.
+            Showing tracked productive and idle minutes for {formatDateInputDisplay(selectedDate)}.
           </p>
           <div className="h-80">
             <ResponsiveContainer height="100%" width="100%">
-              <BarChart data={chartData} margin={barChartMargin}>
+              <BarChart data={chartRows} margin={barChartMargin}>
                 <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
                 <XAxis dataKey="hour" padding={barXAxisPadding} stroke="#94a3b8" />
                 <YAxis stroke="#94a3b8" />
@@ -1955,8 +2158,22 @@ function ActivityView({
                   contentStyle={chartTooltipStyle}
                   labelStyle={chartTooltipTextStyle}
                 />
-                <Bar dataKey="keyboard" fill="#22d3ee" name="Productive Time" radius={[6, 6, 0, 0]} />
-                <Bar dataKey="mouse" fill="#34d399" name="Idle Time" radius={[6, 6, 0, 0]} />
+                <Bar dataKey="keyboard" fill="#22d3ee" name="Productive Time" radius={[6, 6, 0, 0]}>
+                  {chartRows.map((item) => (
+                    <Cell
+                      fill={normalizedSearch ? (item.isHighlighted ? "#22d3ee" : "#334155") : "#22d3ee"}
+                      key={`${item.hour}-productive`}
+                    />
+                  ))}
+                </Bar>
+                <Bar dataKey="mouse" fill="#34d399" name="Idle Time" radius={[6, 6, 0, 0]}>
+                  {chartRows.map((item) => (
+                    <Cell
+                      fill={normalizedSearch ? (item.isHighlighted ? "#34d399" : "#475569") : "#34d399"}
+                      key={`${item.hour}-idle`}
+                    />
+                  ))}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -1968,20 +2185,20 @@ function ActivityView({
               <KeyboardMetric icon={<Activity size={20} />} label="Active Sessions" value={`${activeSessions}`} />
             </div>
             <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-4 text-emerald-100">
-              <KeyboardMetric icon={<MousePointer2 size={20} />} label="Tracked Employees" value={`${rows.length}`} />
+              <KeyboardMetric icon={<MousePointer2 size={20} />} label="Tracked Employees" value={`${trackedEmployees}`} />
             </div>
             <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-amber-100">
               <KeyboardMetric
                 icon={<Clock3 size={20} />}
                 label="Average Idle Time"
-                value={`${Math.round(idleMinutes / Math.max(rows.length, 1))}m`}
+                value={`${Math.round(idleMinutes / Math.max(trackedEmployees, 1))}m`}
               />
             </div>
           </div>
         </SectionCard>
       </div>
 
-      <SessionUsageTables rows={sessionUsageRows} />
+      <SessionUsageTables appWebsiteRows={visibleCurrentLoginAppRows} rows={visibleSessionRows} />
     </div>
   );
 }
@@ -1989,23 +2206,10 @@ function ActivityView({
 function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
   const [screenshots, setScreenshots] = useState<EmployeeScreenshot[]>([]);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState("");
-  const [employeeSearch, setEmployeeSearch] = useState("");
-  const [selectedDate, setSelectedDate] = useState(formatDateParam());
+  const [selectedDate, setSelectedDate] = useState("");
+  const [showIdleOnly, setShowIdleOnly] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-
-  const matchedEmployees = useMemo(() => {
-    const query = employeeSearch.trim().toLowerCase();
-
-    if (!query) {
-      return rows;
-    }
-
-    return rows.filter((employee) =>
-      [employee.name, employee.employeeCode, employee.department, employee.role]
-        .filter(Boolean)
-        .some((value) => String(value).toLowerCase().includes(query)),
-    );
-  }, [employeeSearch, rows]);
+  const idleBorderLabel = "Idle > 5 min";
 
   useEffect(() => {
     let isCurrent = true;
@@ -2018,9 +2222,17 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
           limit: selectedEmployeeId ? "100" : "12",
         });
 
+        if (selectedDate) {
+          params.set("date", selectedDate);
+        }
+
         if (selectedEmployeeId) {
           params.set("userId", selectedEmployeeId);
-          params.set("date", selectedDate);
+        }
+
+        if (showIdleOnly) {
+          params.set("isIdle", "true");
+          params.set("limit", "100");
         }
 
         const response = await apiRequest<{ screenshots: EmployeeScreenshot[] }>(`/api/screenshots?${params.toString()}`);
@@ -2046,16 +2258,7 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
       isCurrent = false;
       window.clearInterval(interval);
     };
-  }, [selectedDate, selectedEmployeeId]);
-
-  function openEmployee(employee: EmployeeRow) {
-    if (!employee.id) {
-      return;
-    }
-
-    setSelectedEmployeeId(String(employee.id));
-    setEmployeeSearch(employee.name);
-  }
+  }, [selectedDate, selectedEmployeeId, showIdleOnly]);
 
   return (
     <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
@@ -2067,8 +2270,6 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
               className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-[#111827] px-3 text-sm text-white outline-none"
               onChange={(event) => {
                 setSelectedEmployeeId(event.target.value);
-                const employee = rows.find((item) => String(item.id) === event.target.value);
-                setEmployeeSearch(employee?.name || "");
               }}
               value={selectedEmployeeId}
             >
@@ -2082,54 +2283,42 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
           </div>
 
           <div>
-            <label className="text-xs font-semibold uppercase text-slate-400">Search employee</label>
-            <div className="mt-2 flex h-11 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3">
-              <Search size={17} className="text-slate-400" />
+            <label className="text-xs font-semibold uppercase text-slate-400">Capture date</label>
+            <div className="relative mt-2 flex h-12 items-center gap-3 rounded-xl border border-white/10 bg-white/6 px-4 text-white">
+              <CalendarDays size={18} className="shrink-0 text-cyan-200" />
+              <span className="min-w-0 flex-1 text-sm font-semibold">
+                {selectedDate ? formatDateInputDisplay(selectedDate) : "All recent"}
+              </span>
+              <CalendarCheck size={17} className="shrink-0 text-slate-300" />
               <input
-                className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
-                onChange={(event) => setEmployeeSearch(event.target.value)}
-                placeholder="Name, ID, department"
-                value={employeeSearch}
+                aria-label="Select capture date"
+                className="absolute inset-0 cursor-pointer opacity-0 [color-scheme:dark]"
+                onChange={(event) => setSelectedDate(event.target.value)}
+                type="date"
+                value={selectedDate}
               />
             </div>
           </div>
 
-          {employeeSearch && (
-            <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
-              {matchedEmployees.slice(0, 8).map((employee) => (
-                <button
-                  className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/10"
-                  key={employee.id ?? employee.name}
-                  onClick={() => openEmployee(employee)}
-                  type="button"
-                >
-                  <span>
-                    <span className="block font-semibold text-white">{employee.name}</span>
-                    <span className="text-xs text-slate-400">{employee.employeeCode || employee.department}</span>
-                  </span>
-                  <span className="text-xs text-cyan-100">Open</span>
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div>
-            <label className="text-xs font-semibold uppercase text-slate-400">Capture date</label>
-            <input
-              className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-white/6 px-3 text-sm text-white outline-none [color-scheme:dark]"
-              disabled={!selectedEmployeeId}
-              onChange={(event) => setSelectedDate(event.target.value || formatDateParam())}
-              type="date"
-              value={selectedDate}
-            />
-          </div>
+          <button
+            className={`flex w-full items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold ${
+              showIdleOnly
+                ? "border-rose-300/40 bg-rose-300/15 text-rose-100"
+                : "border-rose-300/20 bg-rose-300/10 text-rose-100 hover:bg-rose-300/15"
+            }`}
+            onClick={() => setShowIdleOnly((value) => !value)}
+            type="button"
+          >
+            <Clock3 size={16} />
+            Idle Screenshots
+          </button>
 
           <button
             className="w-full rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-2.5 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
             onClick={() => {
               setSelectedEmployeeId("");
-              setEmployeeSearch("");
-              setSelectedDate(formatDateParam());
+              setSelectedDate("");
+              setShowIdleOnly(false);
             }}
             type="button"
           >
@@ -2138,7 +2327,7 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
         </div>
       </SectionCard>
 
-      <SectionCard title={selectedEmployeeId ? "Employee Screenshots" : "Recently Captured Screenshots"}>
+      <SectionCard title={showIdleOnly ? "Idle Screenshots" : selectedEmployeeId ? "Employee Screenshots" : "Captured Screenshots"}>
         {isLoading ? (
           <p className="text-sm text-slate-400">Loading screenshots...</p>
         ) : screenshots.length > 0 ? (
@@ -2148,8 +2337,10 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
 
               return (
                 <article
-                  className={`overflow-hidden rounded-2xl border bg-white/5 ${
-                    item.isIdle ? "border-rose-400 ring-1 ring-rose-400/50" : "border-white/10"
+                  className={`overflow-hidden rounded-2xl border-2 bg-white/5 ${
+                    item.isIdle
+                      ? "border-rose-500 shadow-[0_0_0_3px_rgba(244,63,94,0.35)]"
+                      : "border-white/10"
                   }`}
                   key={item.id}
                 >
@@ -2165,8 +2356,8 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
                         <p className="text-xs text-slate-400">{item.user.employeeCode}</p>
                       </div>
                       {item.isIdle && (
-                        <span className="rounded-full bg-rose-300/10 px-2.5 py-1 text-xs font-semibold text-rose-100 ring-1 ring-rose-300/20">
-                          Idle
+                        <span className="rounded-full bg-rose-500/15 px-2.5 py-1 text-xs font-semibold text-rose-100 ring-1 ring-rose-400/40">
+                          {idleBorderLabel}
                         </span>
                       )}
                     </div>
@@ -2185,7 +2376,11 @@ function ScreenshotsView({ rows = [] }: { rows?: EmployeeRow[] }) {
           <p className="text-sm text-slate-400">
             {selectedEmployeeId
               ? "No screenshots captured for this employee on the selected date."
-              : "No screenshots have been captured yet."}
+              : showIdleOnly
+                ? "No idle screenshots have been captured yet."
+              : selectedDate
+                ? "No screenshots captured on the selected date."
+                : "No screenshots captured yet."}
           </p>
         )}
       </SectionCard>
@@ -2442,14 +2637,19 @@ function ReportsView({
 function EmployeeDepartmentReports({
   employees = [],
   exporting,
+  reportDate,
+  searchQuery = "",
   workflows = [],
   onExport,
 }: {
   employees?: EmployeeRow[];
   exporting: boolean;
+  reportDate: string;
+  searchQuery?: string;
   workflows?: WorkflowItem[];
   onExport: (path?: string, fileName?: string) => void;
 }) {
+  const normalizedSearch = searchQuery.trim().toLowerCase();
   const departments = useMemo(() => {
     const grouped = new Map<string, EmployeeRow[]>();
 
@@ -2467,10 +2667,19 @@ function EmployeeDepartmentReports({
   }, [employees]);
   const [selectedDepartment, setSelectedDepartment] = useState("");
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | null>(null);
-  const [reportDate, setReportDate] = useState("");
-  const [isCalendarOpen, setIsCalendarOpen] = useState(false);
   const [summary, setSummary] = useState<EmployeeReportSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
+  const searchedEmployee = useMemo(() => {
+    if (!normalizedSearch) {
+      return null;
+    }
+
+    return employees.find((employee) =>
+      [employee.name, employee.employeeCode, employee.department, employee.role]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(normalizedSearch)),
+    ) ?? null;
+  }, [employees, normalizedSearch]);
 
   useEffect(() => {
     if (!departments.length) {
@@ -2490,12 +2699,18 @@ function EmployeeDepartmentReports({
     departments.find((department) => department.name === selectedDepartment)?.employees || [];
 
   useEffect(() => {
+    if (searchedEmployee) {
+      setSelectedDepartment(searchedEmployee.department || "Unassigned");
+      setSelectedEmployeeId(searchedEmployee.id ?? null);
+      return;
+    }
+
     setSelectedEmployeeId((current) =>
       current && departmentEmployees.some((employee) => employee.id === current)
         ? current
         : departmentEmployees[0]?.id ?? null,
     );
-  }, [departmentEmployees]);
+  }, [departmentEmployees, searchedEmployee]);
 
   const selectedEmployee = departmentEmployees.find((employee) => employee.id === selectedEmployeeId);
   const selectedWorkflows = selectedEmployee
@@ -2554,8 +2769,8 @@ function EmployeeDepartmentReports({
           title: "Productivity",
           value: summary ? `${summary.averageProductivity}%` : selectedEmployee.productivityLabel,
           detail: summary
-            ? `${formatMinutes(summary.totalProductiveMinutes)} productive | ${formatMinutes(summary.totalIdleMinutes)} idle`
-            : `${selectedEmployee.productiveTime || "0m"} productive | ${selectedEmployee.idleTime || "0m"} idle`,
+            ? `${formatMinutes(summary.totalProductiveMinutes)} productive time | ${formatMinutes(summary.totalIdleMinutes)} idle time`
+            : `${selectedEmployee.productiveTime || "0m"} productive time | ${selectedEmployee.idleTime || "0m"} idle time`,
         },
         {
           title: "Attendance",
@@ -2590,12 +2805,12 @@ function EmployeeDepartmentReports({
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[260px_320px_minmax(0,1fr)]">
+    <div className="grid gap-6 xl:grid-cols-[300px_280px_minmax(460px,1fr)]">
       <SectionCard title="Departments">
-        <div className="space-y-2">
+        <div className="space-y-3">
           {departments.map((department) => (
             <button
-              className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm font-semibold transition ${
+              className={`flex w-full items-center justify-between rounded-2xl px-4 py-3 text-left text-base font-semibold transition ${
                 selectedDepartment === department.name
                   ? "bg-cyan-300/10 text-cyan-100 ring-1 ring-cyan-300/20"
                   : "bg-white/5 text-slate-300 hover:bg-white/10"
@@ -2605,17 +2820,17 @@ function EmployeeDepartmentReports({
               type="button"
             >
               <span>{department.name}</span>
-              <span className="text-xs text-slate-400">{department.employees.length}</span>
+              <span className="text-sm text-slate-400">{department.employees.length}</span>
             </button>
           ))}
         </div>
       </SectionCard>
 
       <SectionCard title="Employees">
-        <div className="space-y-2">
+        <div className="space-y-3">
           {departmentEmployees.map((employee) => (
             <button
-              className={`w-full rounded-xl px-3 py-3 text-left transition ${
+              className={`w-full rounded-2xl px-4 py-4 text-left transition ${
                 selectedEmployeeId === employee.id
                   ? "bg-emerald-300/10 text-emerald-100 ring-1 ring-emerald-300/20"
                   : "bg-white/5 text-slate-300 hover:bg-white/10"
@@ -2624,8 +2839,8 @@ function EmployeeDepartmentReports({
               onClick={() => setSelectedEmployeeId(employee.id ?? null)}
               type="button"
             >
-              <p className="font-semibold">{employee.name}</p>
-              <p className="mt-0.5 text-xs text-slate-400">{employee.employeeCode || "No code"}</p>
+              <p className="break-words text-base font-semibold">{employee.name}</p>
+              <p className="mt-1 text-sm text-slate-400">{employee.employeeCode || "No code"}</p>
             </button>
           ))}
         </div>
@@ -2634,7 +2849,7 @@ function EmployeeDepartmentReports({
       <SectionCard
         action={
           <button
-            className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-50 disabled:bg-slate-600 disabled:text-slate-300"
+            className="flex h-12 items-center gap-2 rounded-2xl bg-white px-5 text-base font-semibold text-slate-950 hover:bg-cyan-50 disabled:bg-slate-600 disabled:text-slate-300"
             disabled={exporting || !selectedEmployee}
             onClick={exportSelectedEmployeeReport}
             type="button"
@@ -2645,47 +2860,24 @@ function EmployeeDepartmentReports({
         }
         title={selectedEmployee ? `${selectedEmployee.name} Reports` : "Employee Reports"}
       >
-        <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+        <div className="mb-7 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <p className="text-sm font-semibold text-cyan-100">{reportRangeLabel}</p>
-            <p className="mt-1 text-sm text-slate-400">
+            <p className="text-base font-semibold text-cyan-100">{reportRangeLabel}</p>
+            <p className="mt-2 text-base text-slate-400">
               {summaryLoading ? "Loading selected range..." : "Cards and export follow the selected range."}
             </p>
           </div>
-          <div className="relative">
-            <button
-              aria-label="Select report date range"
-              className="flex size-10 items-center justify-center rounded-xl border border-white/10 bg-white/6 text-cyan-100 hover:bg-white/10"
-              onClick={() => setIsCalendarOpen((open) => !open)}
-              type="button"
-            >
-              <CalendarDays size={18} />
-            </button>
-            {isCalendarOpen && (
-              <div className="absolute right-0 z-20 mt-3 w-64 rounded-2xl border border-white/10 bg-slate-950 p-4 shadow-2xl shadow-black/40">
-                <label className="text-xs font-semibold uppercase text-slate-400">
-                  <span className="flex items-center gap-1"><CalendarDays size={14} /> Date</span>
-                  <input
-                    className="mt-2 h-10 w-full rounded-xl border border-white/10 bg-slate-900 px-3 text-sm text-white"
-                    onChange={(event) => setReportDate(event.target.value)}
-                    type="date"
-                    value={reportDate}
-                  />
-                </label>
-              </div>
-            )}
-          </div>
         </div>
 
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-5">
           {reportCards.map((report) => (
-            <div className="rounded-2xl border border-white/10 bg-white/4 p-4" key={report.title}>
-              <div className="flex size-10 items-center justify-center rounded-xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
-                <FileText size={20} />
+            <div className="min-w-0 rounded-3xl border border-white/10 bg-white/4 p-5" key={report.title}>
+              <div className="flex size-13 items-center justify-center rounded-2xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
+                <FileText size={24} />
               </div>
-              <h3 className="mt-4 font-semibold text-white">{report.title}</h3>
-              <p className="mt-3 text-2xl font-semibold text-white">{report.value}</p>
-              <p className="mt-2 text-sm text-slate-400">{report.detail}</p>
+              <h3 className="mt-6 text-base font-semibold text-white sm:text-lg">{report.title}</h3>
+              <p className="mt-4 text-2xl font-semibold text-white sm:text-3xl">{report.value}</p>
+              <p className="mt-4 text-sm leading-6 text-slate-400 sm:text-base">{report.detail}</p>
             </div>
           ))}
         </div>

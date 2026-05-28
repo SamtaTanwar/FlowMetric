@@ -6,18 +6,25 @@ const { execFile } = require("node:child_process");
 
 let mainWindow = null;
 let trackerState = null;
+let lastScreenshotCapture = {
+  sessionId: null,
+  capturedAtMs: 0,
+};
 let trackerStatus = {
   isRunning: false,
   lastUsage: null,
   lastError: "",
   lastSentAt: null,
   lastScreenshotAt: null,
+  nextScreenshotAt: null,
   lastResponseStatus: null,
 };
 const powershellPath = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const staticOutDir = path.join(__dirname, "out");
 let staticServer = null;
 let staticServerUrl = "";
+const DEFAULT_SCREENSHOT_INTERVAL_MINUTES = 10;
+const DEFAULT_IDLE_THRESHOLD_MINUTES = 5;
 
 const foregroundWindowScript = `
 $memberDefinition = @'
@@ -53,7 +60,29 @@ async function createWindow() {
   });
 
   const startUrl = process.env.ELECTRON_START_URL || await startStaticServer();
-  mainWindow.loadURL(startUrl);
+  let loadAttempts = 0;
+  const maxLoadAttempts = process.env.ELECTRON_START_URL ? 60 : 1;
+  const loadApp = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+
+    loadAttempts += 1;
+    mainWindow.loadURL(startUrl).catch(() => {});
+  };
+
+  mainWindow.webContents.on(
+    "did-fail-load",
+    (_event, _errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
+      if (!isMainFrame || loadAttempts >= maxLoadAttempts) {
+        return;
+      }
+
+      setTimeout(loadApp, 1000);
+    },
+  );
+
+  loadApp();
 }
 
 function resolveStaticFile(pathname) {
@@ -179,15 +208,9 @@ function getForegroundWindow() {
           const appName = String(parsed.appName || "Unknown app").trim();
           const windowTitle = String(parsed.windowTitle || "").trim();
 
-          if (!windowTitle) {
-            trackerStatus.lastError = `Foreground app has empty window title: ${appName}`;
-            resolve(null);
-            return;
-          }
-
           resolve({
             appName,
-            windowTitle,
+            windowTitle: windowTitle || appName,
           });
         } catch {
           trackerStatus.lastError = "Could not parse foreground window output";
@@ -222,7 +245,7 @@ function usageCategory(appName, windowTitle) {
 }
 
 async function sendUsageEvent(usage, durationSeconds) {
-  if (!trackerState || durationSeconds <= 0 || !usage?.windowTitle) {
+  if (!trackerState || durationSeconds <= 0 || !usage?.appName) {
     return;
   }
 
@@ -238,9 +261,9 @@ async function sendUsageEvent(usage, durationSeconds) {
         type: "APP_USAGE",
         durationSeconds,
         appName: usage.appName,
-        windowTitle: usage.windowTitle,
+        windowTitle: usage.windowTitle || usage.appName,
         metadata: {
-          category: usageCategory(usage.appName, usage.windowTitle),
+          category: usageCategory(usage.appName, usage.windowTitle || usage.appName),
           source: "electron-foreground-window",
         },
       }),
@@ -271,7 +294,62 @@ async function captureDesktopScreenshot() {
     throw new Error("Could not capture screen thumbnail");
   }
 
-  return primarySource.thumbnail.toDataURL();
+  const size = primarySource.thumbnail.getSize();
+
+  return {
+    imageDataUrl: primarySource.thumbnail.toDataURL(),
+    width: size.width,
+    height: size.height,
+  };
+}
+
+function addIdleBorderToImageDataUrl(imageDataUrl, width, height) {
+  const safeWidth = Math.max(1, Math.round(width || 1));
+  const safeHeight = Math.max(1, Math.round(height || 1));
+  const strokeWidth = Math.max(8, Math.round(Math.min(safeWidth, safeHeight) * 0.008));
+  const inset = Math.ceil(strokeWidth / 2);
+  const rectWidth = Math.max(1, safeWidth - strokeWidth);
+  const rectHeight = Math.max(1, safeHeight - strokeWidth);
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="${safeWidth}" height="${safeHeight}" viewBox="0 0 ${safeWidth} ${safeHeight}">
+  <image href="${imageDataUrl}" x="0" y="0" width="${safeWidth}" height="${safeHeight}" preserveAspectRatio="none"/>
+  <rect x="${inset}" y="${inset}" width="${rectWidth}" height="${rectHeight}" fill="none" stroke="#ef4444" stroke-width="${strokeWidth}"/>
+</svg>`;
+
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+function setNextScreenshotDueAt(dueAtMs) {
+  if (!trackerState) {
+    return;
+  }
+
+  trackerState.nextScreenshotDueAtMs = dueAtMs;
+  trackerStatus.nextScreenshotAt = new Date(dueAtMs).toISOString();
+}
+
+function scheduleNextScreenshotFrom(fromMs = Date.now()) {
+  if (!trackerState) {
+    return;
+  }
+
+  setNextScreenshotDueAt(fromMs + trackerState.screenshotIntervalMs);
+}
+
+async function runScheduledScreenshotCheck() {
+  if (!trackerState || trackerState.isScreenshotInFlight) {
+    return;
+  }
+
+  if (!trackerState.nextScreenshotDueAtMs || Date.now() < trackerState.nextScreenshotDueAtMs) {
+    return;
+  }
+
+  await sendScreenshot();
+
+  if (trackerState) {
+    scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
+  }
 }
 
 async function sendScreenshot() {
@@ -279,10 +357,30 @@ async function sendScreenshot() {
     return;
   }
 
+  if (trackerState.isScreenshotInFlight) {
+    return;
+  }
+
+  const now = Date.now();
+  const minimumGapMs = Math.min(60_000, Math.max(1_000, trackerState.screenshotIntervalMs - 1_000));
+
+  if (
+    lastScreenshotCapture.sessionId === trackerState.sessionId &&
+    now - lastScreenshotCapture.capturedAtMs < minimumGapMs
+  ) {
+    return;
+  }
+
+  trackerState.isScreenshotInFlight = true;
+
   try {
-    const imageDataUrl = await captureDesktopScreenshot();
+    const screenshot = await captureDesktopScreenshot();
     const currentUsage = trackerState.currentUsage || await getForegroundWindow();
     const idleSeconds = powerMonitor.getSystemIdleTime();
+    const isIdle = idleSeconds > trackerState.idleThresholdSeconds;
+    const imageDataUrl = isIdle
+      ? addIdleBorderToImageDataUrl(screenshot.imageDataUrl, screenshot.width, screenshot.height)
+      : screenshot.imageDataUrl;
     const response = await fetch(`${trackerState.apiBaseUrl}/api/screenshots`, {
       method: "POST",
       headers: {
@@ -293,7 +391,7 @@ async function sendScreenshot() {
         sessionId: trackerState.sessionId,
         imageDataUrl,
         capturedAt: new Date().toISOString(),
-        isIdle: idleSeconds >= trackerState.idleThresholdSeconds,
+        isIdle,
         appName: currentUsage?.appName || null,
         windowTitle: currentUsage?.windowTitle || null,
       }),
@@ -302,8 +400,18 @@ async function sendScreenshot() {
     trackerStatus.lastScreenshotAt = new Date().toISOString();
     trackerStatus.lastResponseStatus = response.status;
     trackerStatus.lastError = response.ok ? "" : `Backend rejected screenshot: ${response.status}`;
+    if (response.ok) {
+      lastScreenshotCapture = {
+        sessionId: trackerState.sessionId,
+        capturedAtMs: Date.now(),
+      };
+    }
   } catch (error) {
     trackerStatus.lastError = error instanceof Error ? error.message : "Could not capture screenshot";
+  } finally {
+    if (trackerState) {
+      trackerState.isScreenshotInFlight = false;
+    }
   }
 }
 
@@ -351,7 +459,7 @@ async function stopTracker() {
   }
 
   clearInterval(trackerState.interval);
-  clearInterval(trackerState.screenshotInterval);
+  clearInterval(trackerState.screenshotMonitorInterval);
 
   if (trackerState.currentUsage) {
     const durationSeconds =
@@ -362,6 +470,7 @@ async function stopTracker() {
 
   trackerState = null;
   trackerStatus.isRunning = false;
+  trackerStatus.nextScreenshotAt = null;
   return { ok: true };
 }
 
@@ -375,9 +484,17 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
     currentUsage: null,
     lastSeenAt: Date.now(),
     pendingSeconds: 0,
-    screenshotInterval: null,
-    screenshotIntervalMs: Math.max(60_000, Number(config.screenshotIntervalMinutes || 10) * 60_000),
-    idleThresholdSeconds: Math.max(60, Number(config.idleThresholdMinutes || 5) * 60),
+    screenshotMonitorInterval: null,
+    isScreenshotInFlight: false,
+    nextScreenshotDueAtMs: null,
+    screenshotIntervalMs: Math.max(
+      60_000,
+      Number(config.screenshotIntervalMinutes || DEFAULT_SCREENSHOT_INTERVAL_MINUTES) * 60_000,
+    ),
+    idleThresholdSeconds: Math.max(
+      60,
+      Number(config.idleThresholdMinutes || DEFAULT_IDLE_THRESHOLD_MINUTES) * 60,
+    ),
     interval: null,
   };
   trackerStatus = {
@@ -386,13 +503,15 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
     lastError: "",
     lastSentAt: null,
     lastScreenshotAt: null,
+    nextScreenshotAt: null,
     lastResponseStatus: null,
   };
 
   await sampleForegroundWindow();
   await sendScreenshot();
   trackerState.interval = setInterval(sampleForegroundWindow, 5000);
-  trackerState.screenshotInterval = setInterval(sendScreenshot, trackerState.screenshotIntervalMs);
+  scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
+  trackerState.screenshotMonitorInterval = setInterval(runScheduledScreenshotCheck, 5000);
 
   return { ok: true, status: trackerStatus };
 });
@@ -401,6 +520,7 @@ ipcMain.handle("desktop-tracker:stop", stopTracker);
 ipcMain.handle("desktop-tracker:status", () => trackerStatus);
 ipcMain.handle("desktop-tracker:capture-now", async () => {
   await sampleForegroundWindow();
+  await sendScreenshot();
   return trackerStatus;
 });
 

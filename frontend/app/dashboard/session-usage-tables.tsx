@@ -72,11 +72,18 @@ function formatMinutes(minutes = 0) {
 }
 
 function formatSeconds(seconds = 0) {
-  if (seconds < 60) {
-    return `${Math.max(0, Math.round(seconds))}s`;
+  const safeSeconds = Math.max(0, Math.round(seconds));
+
+  if (safeSeconds < 60) {
+    return `${safeSeconds}s`;
   }
 
-  return formatMinutes(Math.round(seconds / 60));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+
+  return remainingSeconds > 0
+    ? `${formatMinutes(minutes)} ${remainingSeconds}s`
+    : formatMinutes(minutes);
 }
 
 const usageChartColors = [
@@ -92,6 +99,35 @@ const usageChartColors = [
   "#84cc16",
 ];
 
+const browserAppNames = new Set([
+  "browser",
+  "brave",
+  "chrome",
+  "firefox",
+  "iexplore",
+  "msedge",
+  "opera",
+  "safari",
+]);
+
+function cleanWindowTitle(value?: string | null) {
+  return String(value || "")
+    .replace(/\s+-\s+(Google Chrome|Microsoft Edge|Mozilla Firefox|Brave|Opera)$/i, "")
+    .trim();
+}
+
+function activityDisplayName(item: SessionUsageRow) {
+  const appName = item.appName.trim();
+  const windowTitle = cleanWindowTitle(item.windowTitle);
+  const normalizedAppName = appName.toLowerCase();
+
+  if (browserAppNames.has(normalizedAppName) && windowTitle && windowTitle.toLowerCase() !== normalizedAppName) {
+    return windowTitle;
+  }
+
+  return appName || windowTitle || "Unknown app";
+}
+
 function formatFullDateTime(value?: string | null) {
   if (!value) {
     return "--";
@@ -103,26 +139,6 @@ function formatFullDateTime(value?: string | null) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
-}
-
-function activeSessionClockOutLabel(loginAt?: string | null) {
-  const currentTime = new Intl.DateTimeFormat("en-IN", {
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date());
-
-  if (!loginAt) {
-    return currentTime;
-  }
-
-  const activeMinutes = Math.max(
-    0,
-    Math.round((Date.now() - new Date(loginAt).getTime()) / 60000),
-  );
-
-  return `${currentTime} (${formatMinutes(activeMinutes)})`;
 }
 
 function labelFromEnum(value?: string) {
@@ -221,8 +237,8 @@ export function EmployeeSnapshotTable({
               <th className="px-3 py-3 font-semibold">Status</th>
               <th className="px-3 py-3 font-semibold">Total Idle</th>
               <th className="px-3 py-3 font-semibold">Break Time</th>
-              <th className="px-3 py-3 font-semibold">Productive</th>
-              <th className="px-3 py-3 font-semibold">Unproductive</th>
+              <th className="px-3 py-3 font-semibold">Productive Time</th>
+              <th className="px-3 py-3 font-semibold">Unproductive Time</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/10">
@@ -235,15 +251,7 @@ export function EmployeeSnapshotTable({
                   </td>
                   <td className="px-3 py-3 text-slate-300">{formatFullDateTime(item.loginAt)}</td>
                   <td className="px-3 py-3 text-slate-300">
-                    {item.logoutAt ? (
-                      formatFullDateTime(item.logoutAt)
-                    ) : item.sessionStatus === "ACTIVE" ? (
-                      <span className="font-semibold text-cyan-100">
-                        {activeSessionClockOutLabel(item.loginAt)}
-                      </span>
-                    ) : (
-                      "--"
-                    )}
+                    {item.logoutAt ? formatFullDateTime(item.logoutAt) : "--"}
                   </td>
                   <td className="px-3 py-3">
                     <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${statusStyle(item.sessionLabel)}`}>
@@ -288,7 +296,7 @@ export function AppWebsiteActivityTable({
   const usageByApp = new Map<string, number>();
 
   for (const item of actualUsageRows) {
-    const name = item.appName.trim();
+    const name = activityDisplayName(item);
     usageByApp.set(name, (usageByApp.get(name) || 0) + item.appDurationSeconds);
   }
 
@@ -370,7 +378,13 @@ export function AppWebsiteActivityTable({
   );
 }
 
-export function SessionUsageTables({ rows = [] }: { rows?: SessionUsageRow[] }) {
+export function SessionUsageTables({
+  appWebsiteRows,
+  rows = [],
+}: {
+  appWebsiteRows?: SessionUsageRow[];
+  rows?: SessionUsageRow[];
+}) {
   return (
     <div className="space-y-6">
       <EmployeeSnapshotTable
@@ -380,7 +394,7 @@ export function SessionUsageTables({ rows = [] }: { rows?: SessionUsageRow[] }) 
       />
       <AppWebsiteActivityTable
         previewLimit={5}
-        rows={rows}
+        rows={appWebsiteRows ?? rows}
       />
     </div>
   );
