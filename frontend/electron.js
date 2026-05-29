@@ -47,8 +47,8 @@ $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
 
 async function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
+    width: 1920,
+height: 1080,
     minWidth: 1100,
     minHeight: 720,
     backgroundColor: "#020617",
@@ -57,6 +57,7 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
+    
   });
 
   const startUrl = process.env.ELECTRON_START_URL || await startStaticServer();
@@ -69,6 +70,8 @@ async function createWindow() {
 
     loadAttempts += 1;
     mainWindow.loadURL(startUrl).catch(() => {});
+    mainWindow.maximize();
+mainWindow.show();
   };
 
   mainWindow.webContents.on(
