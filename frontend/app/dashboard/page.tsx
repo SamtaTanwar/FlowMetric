@@ -720,10 +720,12 @@ function SectionCard({
 }) {
   return (
     <section className="rounded-2xl border border-white/10 bg-white/6 p-5 shadow-2xl shadow-black/20 backdrop-blur-xl">
-      <div className="mb-5 flex items-center justify-between gap-4">
-        <h2 className="text-base font-semibold text-white">{title}</h2>
-        {action}
-      </div>
+      {title && (
+  <div className="mb-5 flex items-center justify-between gap-4">
+    <h2 className="text-base font-semibold text-white">{title}</h2>
+    {action}
+  </div>
+)}
       {children}
     </section>
   );
@@ -1846,7 +1848,7 @@ function shiftMonth(offset: number) {
         </div>
       </SectionCard>
 
-      <SectionCard title="Calendar">
+      <SectionCard title="">
         <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
           <div className="mb-4 flex items-center justify-between gap-3">
             <div>
@@ -1902,7 +1904,23 @@ function shiftMonth(offset: number) {
                 selectedDay.getMonth() === today.getMonth() &&
                 selectedDay.getFullYear() === today.getFullYear();
               const isSelected = cellDate === selectedDate;
+              
+              const cellDateObj = cell.day
+  ? new Date(
+      selectedDay.getFullYear(),
+      selectedDay.getMonth(),
+      cell.day
+    )
+  : null;
 
+const isFutureDate = cellDateObj
+  ? cellDateObj >
+    new Date(
+      today.getFullYear(),
+      today.getMonth(),
+      today.getDate()
+    )
+  : false;
               return (
                 <button
                   className={`flex aspect-square items-center justify-center rounded-lg text-xs transition ${
@@ -1910,11 +1928,13 @@ function shiftMonth(offset: number) {
                       ? "bg-cyan-300 text-slate-950 font-semibold"
                       : isToday
                         ? "bg-cyan-300/15 text-cyan-100 ring-1 ring-cyan-300/25"
-                      : cell.day
-                        ? "bg-white/5 text-slate-300 hover:bg-white/10"
+                        : cell.day
+  ? isFutureDate
+    ? "bg-white/5 text-slate-600 cursor-not-allowed"
+    : "bg-white/5 text-slate-300 hover:bg-white/10"
                         : "bg-transparent"
                   }`}
-                  disabled={!cell.day}
+                  disabled={!cell.day || isFutureDate}
                   key={cell.key}
                   onClick={() => cellDate && onSelectDate?.(cellDate)}
                   type="button"
