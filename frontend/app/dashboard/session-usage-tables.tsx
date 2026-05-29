@@ -26,6 +26,7 @@ export type SessionUsageRow = {
   activeMinutes: number;
   productiveMinutes: number;
   unproductiveMinutes: number;
+  unproductiveAppMinutes?: number;
   networkInterruptionMinutes: number;
   appName: string;
   windowTitle: string;

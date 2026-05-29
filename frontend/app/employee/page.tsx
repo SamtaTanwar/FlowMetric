@@ -60,6 +60,7 @@ declare global {
         apiBaseUrl: string;
         token: string;
         sessionId: number;
+        sessionStartedAt?: string;
         screenshotIntervalMinutes?: number;
         idleThresholdMinutes?: number;
       }): Promise<{ ok: boolean; status?: DesktopTrackerStatus }>;
@@ -97,6 +98,7 @@ export default function EmployeeDashboard() {
   const [lastActivityTime, setLastActivityTime] =
   useState(() => Date.now());
   const [sessionId, setSessionId] = useState<number | null>(null);
+  const [sessionStartedAt, setSessionStartedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [currentTimestamp, setCurrentTimestamp] = useState(() => Date.now());
@@ -224,6 +226,7 @@ useEffect(() => {
       setIsTracking(true);
 
       setSessionId(data.activeSession.id);
+      setSessionStartedAt(data.activeSession.loginAt);
 
       setIsOnBreak(data.isOnBreak);
       setBreakStartedAt(data.breakStartedAt ? new Date(data.breakStartedAt).getTime() : null);
@@ -251,7 +254,7 @@ useEffect(() => {
 }, [isAuthorized]);
 
 useEffect(() => {
-  if (!isTracking || !sessionId || isOnBreak) {
+  if (!isTracking || !sessionId || !sessionStartedAt || isOnBreak) {
     return;
   }
 
@@ -259,6 +262,7 @@ useEffect(() => {
     apiBaseUrl: API_BASE_URL,
     token: getStoredToken(),
     sessionId,
+    sessionStartedAt,
     screenshotIntervalMinutes: SCREENSHOT_INTERVAL_MINUTES,
     idleThresholdMinutes: SCREENSHOT_IDLE_THRESHOLD_MINUTES,
   })
@@ -286,7 +290,7 @@ useEffect(() => {
     window.clearInterval(statusInterval);
     window.desktopTracker?.stop().catch(() => null);
   };
-}, [isTracking, sessionId, isOnBreak]);
+}, [isTracking, sessionId, sessionStartedAt, isOnBreak]);
 
 useEffect(() => {
   if (!isTracking || !sessionId) {
@@ -487,6 +491,7 @@ useEffect(() => {
 
     setIsTracking(true);
     setSessionId(data.session.id);
+    setSessionStartedAt(data.session.loginAt);
     setElapsedSeconds(0);
     setBreakSeconds(0);
     setIdleSeconds(0);
@@ -525,6 +530,7 @@ async function handleClockOut() {
 
     setIsTracking(false);
     setSessionId(null);
+    setSessionStartedAt(null);
     setElapsedSeconds(0);
     setIsOnBreak(false);
     setBreakStartedAt(null);
@@ -689,11 +695,6 @@ if (!isAuthorized) {
             <h1 className="text-5xl font-semibold tracking-[-0.04em] text-white md:text-6xl">
               Welcome back{currentUser ? `, ${currentUser.firstName}` : ""}.
             </h1>
-
-            <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-300">
-              Track attendance, manage work activity and monitor productivity
-              through your intelligent employee workspace.
-            </p>
           </div>
 
            {/* Status Cards */}
@@ -869,7 +870,7 @@ if (!isAuthorized) {
                 </h2>
 
                 <p className="mt-3 text-sm leading-7 text-slate-300">
-                  View attendance history, productivity insights and activity reports.
+                  View productivity, time usage, and current work status.
                 </p>
               </div>
             </button>

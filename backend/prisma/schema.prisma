@@ -86,6 +86,7 @@ enum LeaveRequestStatus {
 enum LeaveType {
   SICK
   CASUAL
+  PERSONAL
 }
 
 model Department {

@@ -20,8 +20,11 @@ const io = new socket_io_1.Server(httpServer, {
 const prisma = new client_1.PrismaClient();
 const jwtSecret = process.env.JWT_SECRET || "employee_workflow_secret_key";
 const adminLikeRoles = [client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR];
-const DEFAULT_BREAK_ALLOWANCE_MINUTES = 45;
+const FIRST_BREAK_ALLOWANCE_MINUTES = 45;
+const SECOND_BREAK_ALLOWANCE_MINUTES = 15;
+const DEFAULT_BREAK_ALLOWANCE_MINUTES = FIRST_BREAK_ALLOWANCE_MINUTES + SECOND_BREAK_ALLOWANCE_MINUTES;
 const IDLE_THRESHOLD_MINUTES = 5;
+const SCREENSHOT_INTERVAL_MINUTES = 10;
 app.use((0, cors_1.default)());
 app.use(express_1.default.json({ limit: "1mb" }));
 io.on("connection", (socket) => {
@@ -67,6 +70,9 @@ function dayStart(input) {
     const date = input ? new Date(input) : new Date();
     return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
+function nextDayStart(input = new Date()) {
+    return new Date(input.getFullYear(), input.getMonth(), input.getDate() + 1);
+}
 function minutesBetween(start, end) {
     return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
@@ -95,16 +101,26 @@ function productivityPercent(productiveMinutes, loginMinutes) {
     }
     return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
-function productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES) {
-    const excessBreakMinutes = Math.max(0, breakMinutes - breakAllowanceMinutes);
-    return Math.max(0, loginMinutes - idleMinutes - excessBreakMinutes);
+function productivityPercentFromSeconds(productiveSeconds, loginSeconds) {
+    if (loginSeconds <= 0) {
+        return 0;
+    }
+    return Math.min(100, Math.round((productiveSeconds / loginSeconds) * 100));
+}
+function productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES, excessBreakMinutes) {
+    const breakOverage = excessBreakMinutes ?? Math.max(0, breakMinutes - breakAllowanceMinutes);
+    return Math.max(0, loginMinutes - idleMinutes - breakOverage);
+}
+function productiveSecondsWithBreakAllowance(loginSeconds, idleSeconds, breakSeconds, breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES, excessBreakSeconds) {
+    const breakOverageSeconds = excessBreakSeconds ?? Math.max(0, breakSeconds - breakAllowanceMinutes * 60);
+    return Math.max(0, loginSeconds - idleSeconds - breakOverageSeconds);
 }
 async function getBreakAllowanceMinutes() {
     const policy = await prisma.workPolicy.findFirst({
         orderBy: [{ isDefault: "desc" }, { name: "asc" }],
         select: { breakAllowanceMinutes: true },
     });
-    return policy?.breakAllowanceMinutes ?? DEFAULT_BREAK_ALLOWANCE_MINUTES;
+    return Math.max(policy?.breakAllowanceMinutes ?? 0, DEFAULT_BREAK_ALLOWANCE_MINUTES);
 }
 function csvCell(value) {
     const text = value == null ? "" : String(value);
@@ -432,6 +448,40 @@ function secondsFromEventPairs(events, startType, endType, endAt) {
     }
     return totalSeconds;
 }
+function breakAllowanceFromEvents(events, endAt, fallbackBreakMinutes = 0) {
+    let startedAt = null;
+    const breakDurations = [];
+    for (const event of events) {
+        if (event.type === client_1.TrackingEventType.BREAK_START) {
+            startedAt = event.createdAt;
+        }
+        if (event.type === client_1.TrackingEventType.BREAK_END && startedAt) {
+            breakDurations.push(event.durationSeconds
+                ? Math.max(0, Number(event.durationSeconds))
+                : Math.max(0, Math.round((event.createdAt.getTime() - startedAt.getTime()) / 1000)));
+            startedAt = null;
+        }
+    }
+    if (startedAt) {
+        breakDurations.push(Math.max(0, Math.round((endAt.getTime() - startedAt.getTime()) / 1000)));
+    }
+    const totalBreakMinutes = breakDurations.length
+        ? Math.round(breakDurations.reduce((sum, seconds) => sum + seconds, 0) / 60)
+        : fallbackBreakMinutes;
+    const allowedSeconds = breakDurations.reduce((sum, seconds, index) => {
+        const allowanceMinutes = index === 0
+            ? FIRST_BREAK_ALLOWANCE_MINUTES
+            : index === 1
+                ? SECOND_BREAK_ALLOWANCE_MINUTES
+                : 0;
+        return sum + Math.min(seconds, allowanceMinutes * 60);
+    }, 0);
+    const excessBreakMinutes = Math.max(0, totalBreakMinutes - Math.round(allowedSeconds / 60));
+    return {
+        totalBreakMinutes,
+        excessBreakMinutes,
+    };
+}
 function lastWorkActivityAt(events, fallback) {
     const workActivityTypes = new Set([
         client_1.TrackingEventType.LOGIN,
@@ -463,20 +513,33 @@ function trailingIdleSecondsAfterLastActivity(events, loginAt, endAt) {
 async function finalizeSession(sessionId, input = {}) {
     const session = await prisma.loginSession.findUnique({
         where: { id: sessionId },
-        include: { user: { include: { shift: true } } },
+        include: {
+            user: { include: { shift: true } },
+            events: {
+                where: {
+                    type: {
+                        in: [client_1.TrackingEventType.BREAK_START, client_1.TrackingEventType.BREAK_END],
+                    },
+                },
+                orderBy: { createdAt: "asc" },
+            },
+        },
     });
     if (!session) {
         throw new Error("Tracking session not found");
     }
     const logoutAt = input.logoutAt ?? new Date();
     const loginMinutes = minutesBetween(session.loginAt, logoutAt);
-    const idleMinutes = input.idleMinutes ?? session.idleMinutes;
-    const breakMinutes = input.breakMinutes ?? session.breakMinutes;
+    const rawIdleMinutes = input.idleMinutes ?? session.idleMinutes;
+    const rawBreakMinutes = input.breakMinutes ?? session.breakMinutes;
+    const breakUsage = breakAllowanceFromEvents(session.events, logoutAt, rawBreakMinutes);
+    const breakMinutes = Math.max(rawBreakMinutes, breakUsage.totalBreakMinutes);
+    const idleMinutes = rawIdleMinutes + breakUsage.excessBreakMinutes;
     const lockMinutes = input.lockMinutes ?? session.lockMinutes;
     const breakAllowanceMinutes = await getBreakAllowanceMinutes();
     const nonWorkingUsageMinutes = await nonWorkingUsageMinutesForSession(session.id);
-    const activeMinutes = Math.max(0, (input.activeMinutes ?? loginMinutes - idleMinutes - breakMinutes) - nonWorkingUsageMinutes);
-    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(loginMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
+    const activeMinutes = Math.max(0, (input.activeMinutes ?? loginMinutes - rawIdleMinutes - breakMinutes) - nonWorkingUsageMinutes);
+    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(loginMinutes, rawIdleMinutes, breakMinutes, breakAllowanceMinutes, breakUsage.excessBreakMinutes) - nonWorkingUsageMinutes);
     const date = dayStart(session.loginAt);
     const updatedSession = await prisma.loginSession.update({
         where: { id: session.id },
@@ -592,6 +655,22 @@ async function finalizeStaleActiveSessions(userId) {
             idleMinutes,
         });
     }
+}
+function scheduleMidnightAutoClockOut() {
+    const now = new Date();
+    const nextMidnight = nextDayStart(now);
+    const delayMs = Math.max(1000, nextMidnight.getTime() - now.getTime());
+    setTimeout(async () => {
+        try {
+            await finalizeStaleActiveSessions();
+        }
+        catch (error) {
+            console.error("Failed to auto clock-out sessions at midnight", error);
+        }
+        finally {
+            scheduleMidnightAutoClockOut();
+        }
+    }, delayMs);
 }
 app.get("/", (_req, res) => {
     res.json({
@@ -1042,10 +1121,17 @@ app.get("/api/employees/:id/workday-stats", authenticate, asyncHandler(async (re
     if (!session) {
         res.json({
             date: requestedDate,
+            generatedAt: new Date(),
             sessionId: null,
             loginTime: null,
+            totalSeconds: 0,
+            activeSeconds: 0,
+            idleSeconds: 0,
+            breakSeconds: 0,
+            productiveSeconds: 0,
             activeMinutes: 0,
             idleMinutes: 0,
+            breakMinutes: 0,
             productiveMinutes: 0,
             productivity: 0,
             attendance: "NOT_MARKED",
@@ -1077,21 +1163,9 @@ app.get("/api/employees/:id/workday-stats", authenticate, asyncHandler(async (re
             createdAt: "asc",
         },
     });
-    let idleMinutes = 0;
-    let idleStart = null;
-    for (const event of events) {
-        if (event.type === "IDLE_START") {
-            idleStart = event.createdAt;
-        }
-        if (event.type === "IDLE_END" &&
-            idleStart) {
-            idleMinutes += Math.floor((event.createdAt.getTime() -
-                idleStart.getTime()) /
-                60000);
-            idleStart = null;
-        }
-    }
-    const nonWorkingUsageMinutes = Math.round(events.reduce((sum, event) => {
+    const endTime = session.logoutAt || new Date();
+    const idleSecondsFromEvents = secondsFromEventPairs(events, client_1.TrackingEventType.IDLE_START, client_1.TrackingEventType.IDLE_END, endTime);
+    const nonWorkingUsageSeconds = events.reduce((sum, event) => {
         if (event.type !== client_1.TrackingEventType.APP_USAGE) {
             return sum;
         }
@@ -1100,23 +1174,40 @@ app.get("/api/employees/:id/workday-stats", authenticate, asyncHandler(async (re
             return sum;
         }
         return sum + (event.durationSeconds ?? 0);
-    }, 0) / 60);
-    const endTime = session.logoutAt || new Date();
-    const totalMinutes = Math.floor((endTime.getTime() -
-        session.loginAt.getTime()) /
-        60000);
+    }, 0);
+    const nonWorkingUsageMinutes = Math.round(nonWorkingUsageSeconds / 60);
+    const totalSeconds = Math.max(0, Math.round((endTime.getTime() - session.loginAt.getTime()) / 1000));
+    const totalMinutes = Math.floor(totalSeconds / 60);
     const breakAllowanceMinutes = await getBreakAllowanceMinutes();
-    const activeMinutes = Math.max(0, totalMinutes - idleMinutes - session.breakMinutes - nonWorkingUsageMinutes);
-    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, idleMinutes, session.breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
-    const productivity = productivityPercent(productiveMinutes, totalMinutes);
+    const breakUsage = breakAllowanceFromEvents(events, endTime, session.breakMinutes);
+    const breakMinutes = Math.max(session.breakMinutes, breakUsage.totalBreakMinutes);
+    const rawIdleSeconds = Math.max(session.idleMinutes * 60, idleSecondsFromEvents);
+    const rawIdleMinutes = Math.round(rawIdleSeconds / 60);
+    const breakSeconds = breakMinutes * 60;
+    const excessBreakSeconds = breakUsage.excessBreakMinutes * 60;
+    const idleSeconds = rawIdleSeconds + excessBreakSeconds;
+    const idleMinutes = Math.round(idleSeconds / 60);
+    const activeMinutes = Math.max(0, totalMinutes - rawIdleMinutes - breakMinutes - nonWorkingUsageMinutes);
+    const activeSeconds = Math.max(0, totalSeconds - rawIdleSeconds - breakSeconds - nonWorkingUsageSeconds);
+    const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, rawIdleMinutes, breakMinutes, breakAllowanceMinutes, breakUsage.excessBreakMinutes) - nonWorkingUsageMinutes);
+    const productiveSeconds = Math.max(0, productiveSecondsWithBreakAllowance(totalSeconds, rawIdleSeconds, breakSeconds, breakAllowanceMinutes, excessBreakSeconds) - nonWorkingUsageSeconds);
+    const productivity = productivityPercentFromSeconds(productiveSeconds, totalSeconds);
+    const useSavedRecord = session.status === client_1.SessionStatus.COMPLETED && productivityRecord;
     res.json({
         date: requestedDate,
+        generatedAt: endTime,
         sessionId: session.id,
         loginTime: session.loginAt,
-        activeMinutes: productivityRecord?.activeMinutes ?? activeMinutes,
-        idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
-        productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
-        productivity: productivityRecord?.productivityPercent ?? productivity,
+        totalSeconds,
+        activeSeconds: useSavedRecord ? productivityRecord.activeMinutes * 60 : activeSeconds,
+        idleSeconds: useSavedRecord ? productivityRecord.idleMinutes * 60 : idleSeconds,
+        breakSeconds,
+        productiveSeconds: useSavedRecord ? productivityRecord.productiveMinutes * 60 : productiveSeconds,
+        activeMinutes: useSavedRecord ? productivityRecord.activeMinutes : activeMinutes,
+        idleMinutes: useSavedRecord ? productivityRecord.idleMinutes : idleMinutes,
+        breakMinutes,
+        productiveMinutes: useSavedRecord ? productivityRecord.productiveMinutes : productiveMinutes,
+        productivity: useSavedRecord ? productivityRecord.productivityPercent : productivity,
         attendance: attendanceRecord?.status ?? "NOT_MARKED",
         isFinalized: session.status === client_1.SessionStatus.COMPLETED,
     });
@@ -1193,12 +1284,42 @@ app.post("/api/screenshots", authenticate, asyncHandler(async (req, res) => {
         res.status(403).json({ message: "Screenshots can be uploaded only during an active clock-in session" });
         return;
     }
+    const requestedCapturedAt = capturedAt ? new Date(capturedAt) : new Date();
+    if (!Number.isFinite(requestedCapturedAt.getTime())) {
+        res.status(400).json({ message: "Invalid screenshot capture time" });
+        return;
+    }
+    const screenshotIntervalMs = SCREENSHOT_INTERVAL_MINUTES * 60 * 1000;
+    const firstAllowedAt = new Date(session.loginAt.getTime() + screenshotIntervalMs);
+    if (requestedCapturedAt.getTime() < firstAllowedAt.getTime()) {
+        res.status(409).json({
+            message: `First screenshot is allowed ${SCREENSHOT_INTERVAL_MINUTES} minutes after login`,
+            nextAllowedAt: firstAllowedAt,
+        });
+        return;
+    }
+    const latestScreenshot = await prisma.employeeScreenshot.findFirst({
+        where: {
+            userId: user.id,
+            sessionId: session.id,
+        },
+        orderBy: { capturedAt: "desc" },
+        select: { capturedAt: true },
+    });
+    if (latestScreenshot &&
+        requestedCapturedAt.getTime() - latestScreenshot.capturedAt.getTime() < screenshotIntervalMs) {
+        res.status(409).json({
+            message: `Screenshots are allowed only every ${SCREENSHOT_INTERVAL_MINUTES} minutes`,
+            nextAllowedAt: new Date(latestScreenshot.capturedAt.getTime() + screenshotIntervalMs),
+        });
+        return;
+    }
     const screenshot = await prisma.employeeScreenshot.create({
         data: {
             userId: user.id,
             sessionId: session.id,
             imageDataUrl,
-            capturedAt: capturedAt ? new Date(capturedAt) : new Date(),
+            capturedAt: requestedCapturedAt,
             isIdle: Boolean(isIdle),
             appName: appName ? String(appName) : null,
             windowTitle: windowTitle ? String(windowTitle) : null,
@@ -1227,6 +1348,8 @@ app.get("/api/screenshots", authenticate, requireRoles(client_1.UserRole.ADMIN, 
     const userId = req.query.userId ? Number(req.query.userId) : undefined;
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 24));
     const date = req.query.date ? dayStart(String(req.query.date)) : undefined;
+    const isIdle = req.query.isIdle === "true" ? true : undefined;
+    const department = typeof req.query.department === "string" ? req.query.department.trim() : "";
     const capturedAt = date
         ? {
             gte: date,
@@ -1237,6 +1360,18 @@ app.get("/api/screenshots", authenticate, requireRoles(client_1.UserRole.ADMIN, 
         where: {
             ...(userId ? { userId } : {}),
             ...(capturedAt ? { capturedAt } : {}),
+            ...(isIdle === true ? { isIdle: true } : {}),
+            ...(department
+                ? {
+                    user: {
+                        department: {
+                            name: {
+                                contains: department,
+                            },
+                        },
+                    },
+                }
+                : {}),
         },
         include: {
             user: {
@@ -1248,6 +1383,28 @@ app.get("/api/screenshots", authenticate, requireRoles(client_1.UserRole.ADMIN, 
                     department: true,
                 },
             },
+        },
+        orderBy: { capturedAt: "desc" },
+        take: limit,
+    });
+    res.json({ screenshots });
+}));
+app.get("/api/my/screenshots", authenticate, asyncHandler(async (req, res) => {
+    const user = getAuthUser(req);
+    const sessionId = req.query.sessionId ? Number(req.query.sessionId) : undefined;
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 24));
+    if (!user) {
+        res.status(401).json({ message: "Authentication required" });
+        return;
+    }
+    if (!isEmployeeAccount(user)) {
+        res.status(403).json({ message: "Only employee accounts can view their screenshots" });
+        return;
+    }
+    const screenshots = await prisma.employeeScreenshot.findMany({
+        where: {
+            userId: user.id,
+            ...(sessionId ? { sessionId } : {}),
         },
         orderBy: { capturedAt: "desc" },
         take: limit,
@@ -1485,17 +1642,30 @@ app.get("/api/employees/:id/app-usage", authenticate, asyncHandler(async (req, r
 app.get("/api/admin/session-usage", authenticate, requireRoles(client_1.UserRole.ADMIN, client_1.UserRole.MANAGER, client_1.UserRole.HR), asyncHandler(async (req, res) => {
     await finalizeStaleActiveSessions();
     const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    const todayActiveOnly = String(req.query.todayActiveOnly || "").toLowerCase() === "true";
     const since = req.query.since
         ? dayStart(String(req.query.since))
         : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const todayStart = dayStart();
+    const tomorrowStart = nextDayStart(todayStart);
     const sessions = await prisma.loginSession.findMany({
         where: {
             user: { role: client_1.UserRole.EMPLOYEE },
-            OR: [
-                { status: client_1.SessionStatus.ACTIVE },
-                { loginAt: { gte: since } },
-                { logoutAt: { gte: since } },
-            ],
+            ...(todayActiveOnly
+                ? {
+                    status: client_1.SessionStatus.ACTIVE,
+                    loginAt: {
+                        gte: todayStart,
+                        lt: tomorrowStart,
+                    },
+                }
+                : {
+                    OR: [
+                        { status: client_1.SessionStatus.ACTIVE },
+                        { loginAt: { gte: since } },
+                        { logoutAt: { gte: since } },
+                    ],
+                }),
         },
         include: {
             user: {
@@ -1536,11 +1706,12 @@ app.get("/api/admin/session-usage", authenticate, requireRoles(client_1.UserRole
         const trailingIdleSeconds = session.status === client_1.SessionStatus.COMPLETED
             ? trailingIdleSecondsAfterLastActivity(session.events, session.loginAt, endTime)
             : 0;
-        const breakSecondsFromEvents = secondsFromEventPairs(session.events, client_1.TrackingEventType.BREAK_START, client_1.TrackingEventType.BREAK_END, endTime);
-        const idleMinutes = Math.max(session.status === client_1.SessionStatus.ACTIVE
+        const rawIdleMinutes = Math.max(session.status === client_1.SessionStatus.ACTIVE
             ? await idleMinutesWithOpenIdle(session.id, session.idleMinutes, endTime)
             : session.idleMinutes, Math.round((idleSecondsFromEvents + trailingIdleSeconds) / 60));
-        const breakMinutes = Math.max(session.breakMinutes, Math.round(breakSecondsFromEvents / 60));
+        const breakUsage = breakAllowanceFromEvents(session.events, endTime, session.breakMinutes);
+        const breakMinutes = Math.max(session.breakMinutes, breakUsage.totalBreakMinutes);
+        const idleMinutes = rawIdleMinutes + breakUsage.excessBreakMinutes;
         const usageByKey = new Map();
         for (const event of session.events) {
             if (event.type !== client_1.TrackingEventType.APP_USAGE) {
@@ -1577,9 +1748,9 @@ app.get("/api/admin/session-usage", authenticate, requireRoles(client_1.UserRole
         const unproductiveMinutes = idleMinutes + unproductiveAppMinutes;
         const nonWorkingUsageMinutes = unproductiveAppMinutes + networkInterruptionMinutes;
         const totalMinutes = minutesBetween(session.loginAt, endTime);
-        const activeMinutes = Math.max(0, totalMinutes - idleMinutes - breakMinutes - nonWorkingUsageMinutes);
+        const activeMinutes = Math.max(0, totalMinutes - rawIdleMinutes - breakMinutes - nonWorkingUsageMinutes);
         const breakAllowanceMinutes = await getBreakAllowanceMinutes();
-        const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, idleMinutes, breakMinutes, breakAllowanceMinutes) - nonWorkingUsageMinutes);
+        const productiveMinutes = Math.max(0, productiveMinutesWithBreakAllowance(totalMinutes, rawIdleMinutes, breakMinutes, breakAllowanceMinutes, breakUsage.excessBreakMinutes) - nonWorkingUsageMinutes);
         const autoClosedAt = new Date(dayStart(session.loginAt).getTime() + 24 * 60 * 60 * 1000);
         const sessionLabel = session.status === client_1.SessionStatus.ACTIVE
             ? "Active"
@@ -1837,6 +2008,13 @@ app.get("/api/productivity/employee/:id", authenticate, asyncHandler(async (req,
 app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
     const user = getAuthUser(req);
     const requestedUserId = req.query.userId ? Number(req.query.userId) : undefined;
+    const requestedDate = typeof req.query.date === "string" && req.query.date ? dayStart(req.query.date) : undefined;
+    const dateRange = requestedDate
+        ? {
+            gte: requestedDate,
+            lt: new Date(requestedDate.getTime() + 24 * 60 * 60 * 1000),
+        }
+        : undefined;
     if (!user) {
         res.status(401).json({ message: "Authentication required" });
         return;
@@ -1845,7 +2023,10 @@ app.get("/api/attendance", authenticate, asyncHandler(async (req, res) => {
     const userId = canViewAny ? requestedUserId : user.id;
     const take = req.query.all === "true" ? undefined : 100;
     const records = await prisma.attendanceRecord.findMany({
-        where: userId ? { userId } : {},
+        where: {
+            ...(userId ? { userId } : {}),
+            ...(dateRange ? { date: dateRange } : {}),
+        },
         include: {
             user: {
                 select: {
@@ -2036,7 +2217,10 @@ app.post("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
         return;
     }
     const leaveDays = Number(days);
-    const leaveType = String(type).toUpperCase() === client_1.LeaveType.CASUAL ? client_1.LeaveType.CASUAL : client_1.LeaveType.SICK;
+    const requestedLeaveType = String(type).toUpperCase();
+    const leaveType = Object.values(client_1.LeaveType).includes(requestedLeaveType)
+        ? requestedLeaveType
+        : client_1.LeaveType.SICK;
     if (!reason || !Number.isInteger(leaveDays) || leaveDays <= 0) {
         res.status(400).json({ message: "Reason and valid leave days are required" });
         return;
@@ -2724,5 +2908,9 @@ app.use((err, _req, res, _next) => {
 const PORT = Number(process.env.PORT) || 5000;
 httpServer.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    finalizeStaleActiveSessions().catch((error) => {
+        console.error("Failed to finalize stale sessions on startup", error);
+    });
+    scheduleMidnightAutoClockOut();
 });
 //# sourceMappingURL=server.js.map

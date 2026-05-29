@@ -328,12 +328,32 @@ function setNextScreenshotDueAt(dueAtMs) {
   trackerStatus.nextScreenshotAt = new Date(dueAtMs).toISOString();
 }
 
+function nextScreenshotCadenceAt(fromMs = Date.now()) {
+  if (!trackerState) {
+    return Date.now();
+  }
+
+  const intervalMs = trackerState.screenshotIntervalMs;
+  const sessionStartedAtMs = trackerState.sessionStartedAtMs || fromMs;
+
+  if (lastScreenshotCapture.sessionId === trackerState.sessionId && lastScreenshotCapture.capturedAtMs > 0) {
+    return lastScreenshotCapture.capturedAtMs + intervalMs;
+  }
+
+  if (fromMs <= sessionStartedAtMs) {
+    return sessionStartedAtMs + intervalMs;
+  }
+
+  const intervalsElapsed = Math.floor((fromMs - sessionStartedAtMs) / intervalMs);
+  return sessionStartedAtMs + (intervalsElapsed + 1) * intervalMs;
+}
+
 function scheduleNextScreenshotFrom(fromMs = Date.now()) {
   if (!trackerState) {
     return;
   }
 
-  const dueAtMs = fromMs + trackerState.screenshotIntervalMs;
+  const dueAtMs = nextScreenshotCadenceAt(fromMs);
   const delayMs = Math.max(1_000, dueAtMs - Date.now());
 
   if (trackerState.screenshotInterval) {
@@ -366,7 +386,7 @@ async function sendScreenshot() {
   }
 
   const now = Date.now();
-  const minimumGapMs = Math.min(60_000, Math.max(1_000, trackerState.screenshotIntervalMs - 1_000));
+  const minimumGapMs = trackerState.screenshotIntervalMs;
 
   if (
     lastScreenshotCapture.sessionId === trackerState.sessionId &&
@@ -409,6 +429,17 @@ async function sendScreenshot() {
         sessionId: trackerState.sessionId,
         capturedAtMs: Date.now(),
       };
+    } else if (response.status === 409) {
+      const body = await response.json().catch(() => null);
+      const nextAllowedAtMs = body?.nextAllowedAt ? new Date(body.nextAllowedAt).getTime() : NaN;
+
+      if (Number.isFinite(nextAllowedAtMs)) {
+        lastScreenshotCapture = {
+          sessionId: trackerState.sessionId,
+          capturedAtMs: nextAllowedAtMs - trackerState.screenshotIntervalMs,
+        };
+        trackerStatus.nextScreenshotAt = new Date(nextAllowedAtMs).toISOString();
+      }
     }
   } catch (error) {
     trackerStatus.lastError = error instanceof Error ? error.message : "Could not capture screenshot";
@@ -485,6 +516,9 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
     apiBaseUrl: String(config.apiBaseUrl || "").replace(/\/$/, ""),
     token: String(config.token || ""),
     sessionId: Number(config.sessionId),
+    sessionStartedAtMs: Number.isFinite(new Date(config.sessionStartedAt).getTime())
+      ? new Date(config.sessionStartedAt).getTime()
+      : Date.now(),
     currentUsage: null,
     lastSeenAt: Date.now(),
     pendingSeconds: 0,
@@ -512,9 +546,8 @@ ipcMain.handle("desktop-tracker:start", async (_event, config) => {
   };
 
   await sampleForegroundWindow();
-  await sendScreenshot();
   trackerState.interval = setInterval(sampleForegroundWindow, 5000);
-  scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
+  scheduleNextScreenshotFrom(Date.now());
 
   return { ok: true, status: trackerStatus };
 });
@@ -524,8 +557,8 @@ ipcMain.handle("desktop-tracker:status", () => trackerStatus);
 ipcMain.handle("desktop-tracker:capture-now", async () => {
   await sampleForegroundWindow();
   await sendScreenshot();
-  if (trackerState && lastScreenshotCapture.sessionId === trackerState.sessionId) {
-    scheduleNextScreenshotFrom(lastScreenshotCapture.capturedAtMs || Date.now());
+  if (trackerState) {
+    scheduleNextScreenshotFrom(Date.now());
   }
   return trackerStatus;
 });

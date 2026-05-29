@@ -6,12 +6,42 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { allowProtectedNavigation, apiRequest, canOpenProtectedRoute, clearAuth, getStoredUser, isEmployeeAccount } from "@/lib/api";
 
+function todayInputValue() {
+  const today = new Date();
+  const offsetToday = new Date(today.getTime() - today.getTimezoneOffset() * 60 * 1000);
+  return offsetToday.toISOString().slice(0, 10);
+}
+
+function daysBetweenDates(fromDate: string, toDate: string) {
+  if (!fromDate || !toDate) {
+    return 0;
+  }
+
+  const start = new Date(`${fromDate}T00:00:00`);
+  const end = new Date(`${toDate}T00:00:00`);
+  const difference = end.getTime() - start.getTime();
+
+  if (difference < 0) {
+    return 0;
+  }
+
+  return Math.floor(difference / (24 * 60 * 60 * 1000)) + 1;
+}
+
 export default function LeaveRequestPage() {
   const router = useRouter();
   const [type, setType] = useState("SICK");
   const [reason, setReason] = useState("");
-  const [days, setDays] = useState(1);
+  const [fromDate, setFromDate] = useState(todayInputValue);
+  const [toDate, setToDate] = useState(todayInputValue);
   const [isSending, setIsSending] = useState(false);
+  const days = daysBetweenDates(fromDate, toDate);
+
+  useEffect(() => {
+    if (fromDate && toDate && fromDate > toDate) {
+      setToDate(fromDate);
+    }
+  }, [fromDate, toDate]);
 
   useEffect(() => {
     const user = getStoredUser();
@@ -32,7 +62,7 @@ export default function LeaveRequestPage() {
     event.preventDefault();
 
     if (!reason.trim() || days <= 0) {
-      toast.error("Reason and leave days are required");
+      toast.error("Reason and valid leave dates are required");
       return;
     }
 
@@ -99,6 +129,7 @@ export default function LeaveRequestPage() {
               >
                 <option value="SICK">Sick Leave</option>
                 <option value="CASUAL">Casual Leave</option>
+                <option value="PERSONAL">Personal Leave</option>
               </select>
             </label>
 
@@ -113,23 +144,40 @@ export default function LeaveRequestPage() {
               />
             </label>
 
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-slate-300">From</span>
+                <input
+                  className="h-14 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-white outline-none placeholder:text-slate-500 focus:ring-2 focus:ring-cyan-400/40 [color-scheme:dark]"
+                  onChange={(event) => setFromDate(event.target.value)}
+                  required
+                  type="date"
+                  value={fromDate}
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-slate-300">To</span>
+                <input
+                  className="h-14 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-white outline-none placeholder:text-slate-500 focus:ring-2 focus:ring-cyan-400/40 [color-scheme:dark]"
+                  min={fromDate}
+                  onChange={(event) => setToDate(event.target.value)}
+                  required
+                  type="date"
+                  value={toDate}
+                />
+              </label>
+            </div>
+
             <label className="block">
               <span className="mb-2 block text-sm font-medium text-slate-300">Days</span>
               <input
-                className="h-14 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-white outline-none placeholder:text-slate-500 focus:ring-2 focus:ring-cyan-400/40"
-                min={1}
-                onChange={(event) => setDays(Number(event.target.value))}
-                required
+                className="h-14 w-full rounded-2xl border border-white/10 bg-white/5 px-4 text-white outline-none"
+                readOnly
                 type="number"
                 value={days}
               />
             </label>
-
-            {type === "SICK" && (
-              <p className="rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-100">
-                1 sick leave day is paid per month. Extra sick leave days in the same month are unpaid.
-              </p>
-            )}
 
             <button
               className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-cyan-300 font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:opacity-60"

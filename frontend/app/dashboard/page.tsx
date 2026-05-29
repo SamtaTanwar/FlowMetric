@@ -30,17 +30,11 @@ import {
 import { motion } from "framer-motion";
 import { useRouter } from "next/navigation";
 import {
-  Bar,
-  BarChart,
-  CartesianGrid,
   Cell,
-  LabelList,
   Pie,
   PieChart,
   ResponsiveContainer,
   Tooltip,
-  XAxis,
-  YAxis,
 } from "recharts";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -131,10 +125,17 @@ const HALF_DAY_WORK_MINUTES = 4 * 60;
 
 type WorkdayStats = {
   date?: string;
+  generatedAt?: string;
   sessionId?: number | null;
   loginTime: string | null;
+  totalSeconds?: number;
+  activeSeconds?: number;
+  idleSeconds?: number;
+  breakSeconds?: number;
+  productiveSeconds?: number;
   activeMinutes: number;
   idleMinutes: number;
+  breakMinutes?: number;
   productiveMinutes: number;
   productivity: number;
   attendance?: string;
@@ -236,7 +237,7 @@ type ApiNotification = {
 
 type ApiLeaveRequest = {
   id: number;
-  type: "SICK" | "CASUAL";
+  type: "SICK" | "CASUAL" | "PERSONAL";
   reason: string;
   days: number;
   paidDays: number;
@@ -337,7 +338,13 @@ function formatSeconds(seconds = 0) {
     return `${Math.max(0, Math.round(seconds))}s`;
   }
 
-  return formatMinutes(Math.round(seconds / 60));
+  const safeSeconds = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+
+  return remainingSeconds > 0
+    ? `${formatMinutes(minutes)} ${remainingSeconds}s`
+    : formatMinutes(minutes);
 }
 
 function minutesFromLabel(value?: string) {
@@ -604,9 +611,6 @@ const chartTooltipTextStyle = {
   color: "#020617",
 };
 
-const barChartMargin = { top: 24, right: 24, bottom: 0, left: 12 };
-const barXAxisPadding = { left: 32, right: 32 };
-
 function formatPercentValue(value: unknown) {
   const numericValue = Number(value);
 
@@ -615,6 +619,22 @@ function formatPercentValue(value: unknown) {
   }
 
   return `${Math.round(numericValue)}%`;
+}
+
+function attendanceScore(attendance: string) {
+  if (attendance === "Present") {
+    return 100;
+  }
+
+  if (attendance === "Late") {
+    return 70;
+  }
+
+  if (attendance === "Half Day") {
+    return 50;
+  }
+
+  return 0;
 }
 
 function AttendanceMark({ checked }: { checked: boolean }) {
@@ -732,12 +752,12 @@ export default function DashboardPage() {
   });
   const [attendanceRecords, setAttendanceRecords] = useState<ApiAttendanceRecord[]>([]);
   const [departmentChartData, setDepartmentChartData] = useState<Array<{ name: string; value: number; color: string }>>([]);
-  const [productivityChartData, setProductivityChartData] = useState<Array<{ day: string; productivity: number; attendance: number; tasks: number }>>([]);
   const [activityChartData, setActivityChartData] = useState<Array<{ hour: string; keyboard: number; mouse: number }>>([]);
   const [isExporting, setIsExporting] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedEmployee, setSelectedEmployee] = useState<EmployeeRow | null>(null);
   const [selectedWorkdayDate, setSelectedWorkdayDate] = useState(formatDateParam());
+  const [currentTimestamp, setCurrentTimestamp] = useState(() => Date.now());
   const [reportDate, setReportDate] = useState("");
   const [attendanceDate, setAttendanceDate] = useState(formatDateParam());
   const [activityDate, setActivityDate] = useState(formatDateParam());
@@ -785,6 +805,11 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
         : headerDateTab === "screenshots"
           ? "Select screenshot date"
           : "Select activity date";
+
+  useEffect(() => {
+    const tick = window.setInterval(() => setCurrentTimestamp(Date.now()), 1000);
+    return () => window.clearInterval(tick);
+  }, []);
 
   function setHeaderDate(value: string) {
     if (headerDateTab === "reports") {
@@ -934,14 +959,6 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
             ? mappedEmployees.find((employee) => employee.id === current.id) ?? current
             : mappedEmployees[0] ?? null,
         );
-        setProductivityChartData(
-          mappedEmployees.map((employee) => ({
-            day: employee.name,
-            productivity: employee.productivity,
-            attendance: employee.attendance === "Present" ? 100 : employee.attendance === "Late" ? 70 : employee.attendance === "Half Day" ? 50 : 0,
-            tasks: Number.parseInt(employee.tasks, 10) || 0,
-          })),
-        );
         setActivityChartData(
           mappedEmployees.map((employee) => ({
             hour: employee.name,
@@ -1050,6 +1067,32 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
         .some((value) => String(value).toLowerCase().includes(query)),
     );
   }, [employeeRows, searchQuery]);
+  const overviewStats = useMemo(() => {
+    const query = searchQuery.trim();
+    const rows = query ? filteredEmployees : employeeRows;
+    const employeeCount = rows.length;
+    const productivity = employeeCount
+      ? Math.round(rows.reduce((sum, employee) => sum + employee.productivity, 0) / employeeCount)
+      : dashboardStats.avgProductivity;
+    const attendance = employeeCount
+      ? Math.round(rows.reduce((sum, employee) => sum + attendanceScore(employee.attendance), 0) / employeeCount)
+      : dashboardStats.attendancePercent;
+    const departments = Array.from(new Set(rows.map((employee) => employee.department || "Unassigned")));
+    const label = !query
+      ? "All employees"
+      : employeeCount === 1
+        ? rows[0]?.name ?? "No match"
+        : departments.length === 1
+          ? `${departments[0]} department`
+          : `${employeeCount} matches`;
+
+    return {
+      attendance,
+      employeeCount,
+      label,
+      productivity,
+    };
+  }, [dashboardStats.attendancePercent, dashboardStats.avgProductivity, employeeRows, filteredEmployees, searchQuery]);
 
   function selectEmployee(employee: EmployeeRow) {
     setSelectedEmployee(employee);
@@ -1070,14 +1113,21 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
   }
 
   function handleSearchSubmit() {
+    if (activeTab === "activity" || activeTab === "overview" || activeTab === "attendance") {
+      setSearchQuery((value) => value.trim());
+      return;
+    }
+
     if (activeTab === "reports") {
       return;
     }
 
-    const match = filteredEmployees[0];
+    if (activeTab === "employees") {
+      const match = filteredEmployees[0];
 
-    if (match) {
-      selectEmployee(match);
+      if (match) {
+        selectEmployee(match);
+      }
     }
   }
 
@@ -1279,10 +1329,10 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                 {searchQuery && (
                   <button
                     className="h-10 rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
-                    onClick={handleSearchSubmit}
+                    onClick={activeTab === "activity" ? () => setSearchQuery("") : handleSearchSubmit}
                     type="button"
                   >
-                    Open
+                    {activeTab === "activity" ? "Clear" : activeTab === "employees" ? "Open" : "Apply"}
                   </button>
                 )}
                 <button
@@ -1338,14 +1388,14 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               />
               <KpiCard
                 title="Productivity"
-                value={`${dashboardStats.avgProductivity}%`}
-                change={`${dashboardStats.totalRecorded} productivity records`}
+                value={`${overviewStats.productivity}%`}
+                change={searchQuery.trim() ? overviewStats.label : `${dashboardStats.totalRecorded} productivity records`}
                 icon={BarChart3}
               />
               <KpiCard
                 title="Attendance"
-                value={`${dashboardStats.attendancePercent}%`}
-                change={`${dashboardStats.presentCount} present`}
+                value={`${overviewStats.attendance}%`}
+                change={searchQuery.trim() ? `${overviewStats.employeeCount} matched` : `${dashboardStats.presentCount} present`}
                 icon={CalendarCheck}
               />
             </div>
@@ -1355,43 +1405,52 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               <>
                 <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
                   <SectionCard title="Employee Productivity Intelligence">
-                    <div className="h-80">
-                      <ResponsiveContainer height="100%" width="100%">
-                        <BarChart data={productivityChartData} margin={barChartMargin}>
-                          <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-                          <XAxis dataKey="day" padding={barXAxisPadding} stroke="#94a3b8" />
-                          <YAxis stroke="#94a3b8" tickFormatter={formatPercentValue} />
-                          <Tooltip
-                            contentStyle={chartTooltipStyle}
-                            formatter={(value, name) => [formatPercentValue(value), name]}
-                            labelStyle={chartTooltipTextStyle}
-                          />
-                          <Bar
-                            dataKey="productivity"
-                            fill="#22d3ee"
-                            name="Productivity"
-                            radius={[6, 6, 0, 0]}
-                          >
-                            <LabelList
-                              className="fill-slate-200 text-xs font-semibold"
-                              formatter={formatPercentValue}
-                              position="top"
+                    <div className="grid h-80 grid-rows-[minmax(0,1fr)_auto] gap-3">
+                      <div className="min-h-0">
+                        <ResponsiveContainer height="100%" width="100%">
+                          <PieChart>
+                            <Pie
+                              cx="50%"
+                              cy="50%"
+                              data={[
+                                { name: "Attendance", value: overviewStats.attendance },
+                                { name: "Productivity", value: overviewStats.productivity },
+                              ]}
+                              dataKey="value"
+                              innerRadius={62}
+                              nameKey="name"
+                              outerRadius={108}
+                              paddingAngle={5}
+                            >
+                              {["#34d399", "#22d3ee"].map((color) => (
+                                <Cell
+                                  fill={color}
+                                  key={color}
+                                />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              contentStyle={chartTooltipStyle}
+                              formatter={(value, name) => [formatPercentValue(value), name]}
+                              labelStyle={chartTooltipTextStyle}
                             />
-                          </Bar>
-                          <Bar
-                            dataKey="attendance"
-                            fill="#34d399"
-                            name="Attendance"
-                            radius={[6, 6, 0, 0]}
-                          >
-                            <LabelList
-                              className="fill-slate-200 text-xs font-semibold"
-                              formatter={formatPercentValue}
-                              position="top"
-                            />
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        {[
+                          { name: "Attendance", value: overviewStats.attendance, color: "#34d399" },
+                          { name: "Productivity", value: overviewStats.productivity, color: "#22d3ee" },
+                        ].map((item) => (
+                          <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm" key={item.name}>
+                            <span className="flex items-center gap-2 text-slate-300">
+                              <span className="size-2.5 rounded-full" style={{ backgroundColor: item.color }} />
+                              {item.name}
+                            </span>
+                            <span className="font-semibold text-white">{item.value}%</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </SectionCard>
 
@@ -1451,6 +1510,7 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
               notifications={notificationItems.filter((item) => item.userId == null || item.userId === selectedEmployee?.id)}
               onSelectDate={setSelectedWorkdayDate}
               selectedDate={selectedWorkdayDate}
+              currentTimestamp={currentTimestamp}
               workdayStats={workdayStats}
             />
             )}
@@ -1629,6 +1689,7 @@ function EmployeeTable({
 function EmployeeSelfDashboard({
   employee,
   appUsageRows = [],
+  currentTimestamp,
   leaveRequests = [],
   notifications: notificationRows = [],
   onSelectDate,
@@ -1637,6 +1698,7 @@ function EmployeeSelfDashboard({
 }: {
   employee?: EmployeeRow | null;
   appUsageRows?: AppUsageRow[];
+  currentTimestamp: number;
   leaveRequests?: ApiLeaveRequest[];
   notifications?: NotificationItem[];
   onSelectDate?: (date: string) => void;
@@ -1648,9 +1710,25 @@ function EmployeeSelfDashboard({
       <SectionCard title="No employee selected">
         <p className="text-sm text-slate-400">Select an employee from the directory or search to view details.</p>
       </SectionCard>
-    );
-  }
-const productivityValue = workdayStats?.productivity ?? employee.productivity ?? 0;
+  );
+}
+const generatedAt = workdayStats?.generatedAt ? new Date(workdayStats.generatedAt).getTime() : currentTimestamp;
+const shouldTickWorkday =
+  !!workdayStats?.loginTime &&
+  !workdayStats.isFinalized &&
+  selectedDate === formatDateParam() &&
+  Number.isFinite(generatedAt);
+const elapsedSecondsSinceFetch = shouldTickWorkday
+  ? Math.max(0, Math.round((currentTimestamp - generatedAt) / 1000))
+  : 0;
+const totalSeconds = (workdayStats?.totalSeconds ?? 0) + elapsedSecondsSinceFetch;
+const activeSeconds = (workdayStats?.activeSeconds ?? (workdayStats?.activeMinutes ?? 0) * 60) + elapsedSecondsSinceFetch;
+const productiveSeconds = (workdayStats?.productiveSeconds ?? (workdayStats?.productiveMinutes ?? 0) * 60) + elapsedSecondsSinceFetch;
+const idleSeconds = workdayStats?.idleSeconds ?? (workdayStats?.idleMinutes ?? 0) * 60;
+const breakSeconds = workdayStats?.breakSeconds ?? (workdayStats?.breakMinutes ?? 0) * 60;
+const productivityValue = totalSeconds > 0
+  ? Math.min(100, Math.round((productiveSeconds / totalSeconds) * 100))
+  : workdayStats?.productivity ?? employee.productivity ?? 0;
 const summary = [
   {
     label: "Active Now",
@@ -1683,17 +1761,22 @@ const summary = [
 
   {
     label: "Active Time",
-    value: formatMinutes(workdayStats?.activeMinutes ?? 0),
+    value: formatSeconds(activeSeconds),
   },
 
   {
     label: "Idle Time",
-    value: formatMinutes(workdayStats?.idleMinutes ?? 0),
+    value: formatSeconds(idleSeconds),
+  },
+
+  {
+    label: "Break Time",
+    value: formatSeconds(breakSeconds),
   },
 
   {
     label: "Productive Time",
-    value: formatMinutes(workdayStats?.productiveMinutes ?? 0),
+    value: formatSeconds(productiveSeconds),
   },
 ];
 const selectedDay = new Date(`${selectedDate}T00:00:00`);
@@ -1953,58 +2036,95 @@ function AttendanceView({
     const record = employee.employeeCode ? recordByEmployeeCode.get(employee.employeeCode) : undefined;
     return record?.status || "ABSENT";
   };
-  const attendanceChartData = chartRows.map((employee) => {
-    const status = attendanceStatusForEmployee(employee);
-    const isHighlighted = employeeMatchesSearch(employee);
-    const attendance = status === "LATE"
-      ? 70
-      : status === "PRESENT"
-        ? 100
-        : status === "HALF_DAY"
-          ? 50
-          : 0;
-
-    return {
-      day: employee.name,
-      attendance: normalizedSearch && !isHighlighted ? 0 : attendance,
-      isHighlighted,
-    };
-  });
+  const visibleChartRows = chartRows.filter(employeeMatchesSearch);
+  const attendanceBuckets = [
+    { key: "PRESENT", label: "Present", color: "#34d399" },
+    { key: "LATE", label: "Late", color: "#fbbf24" },
+    { key: "HALF_DAY", label: "Half Day", color: "#22d3ee" },
+    { key: "ABSENT", label: "Absent", color: "#fb7185" },
+  ];
+  const attendancePieData = attendanceBuckets.map((bucket) => ({
+    ...bucket,
+    value: visibleChartRows.filter((employee) => attendanceStatusForEmployee(employee) === bucket.key).length,
+  }));
+  const totalAttendanceEmployees = attendancePieData.reduce((sum, item) => sum + item.value, 0);
+  const visibleAttendancePieData = attendancePieData.filter((item) => item.value > 0);
 
   return (
     <div className="space-y-6">
-      <SectionCard title="Team Attendance Overview">
-        <p className="mb-4 text-sm text-slate-400">
-          Showing attendance for {formatDateInputDisplay(selectedDate)}.
-        </p>
-        <div className="h-80">
-          <ResponsiveContainer height="100%" width="100%">
-            <BarChart data={attendanceChartData} margin={barChartMargin}>
-              <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-              <XAxis dataKey="day" padding={barXAxisPadding} stroke="#94a3b8" />
-              <YAxis stroke="#94a3b8" tickFormatter={formatPercentValue} />
-              <Tooltip
-                contentStyle={chartTooltipStyle}
-                formatter={(value, name) => [formatPercentValue(value), name]}
-                labelStyle={chartTooltipTextStyle}
-              />
-              <Bar dataKey="attendance" fill="#34d399" name="Attendance %" radius={[6, 6, 0, 0]}>
-                {attendanceChartData.map((item) => (
-                  <Cell
-                    fill={normalizedSearch ? (item.isHighlighted ? "#34d399" : "#334155") : "#34d399"}
-                    key={item.day}
-                  />
-                ))}
-                <LabelList
-                  className="fill-slate-200 text-xs font-semibold"
-                  formatter={formatPercentValue}
-                  position="top"
-                />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </SectionCard>
+      <div className="mx-auto max-w-5xl">
+        <SectionCard title="Team Attendance Overview">
+          <p className="mb-4 text-sm text-slate-400">
+            Showing attendance distribution for {formatDateInputDisplay(selectedDate)}.
+          </p>
+          <div className="grid items-center gap-8 lg:grid-cols-[minmax(360px,1.1fr)_minmax(320px,0.9fr)]">
+            <div className="h-[360px] lg:h-[420px]">
+              {totalAttendanceEmployees > 0 ? (
+                <ResponsiveContainer height="100%" width="100%">
+                  <PieChart>
+                    <Pie
+                      cx="50%"
+                      cy="50%"
+                      data={visibleAttendancePieData}
+                      dataKey="value"
+                      innerRadius={78}
+                      label={false}
+                      labelLine={false}
+                      nameKey="label"
+                      outerRadius={150}
+                      paddingAngle={3}
+                    >
+                      {visibleAttendancePieData.map((item) => (
+                        <Cell fill={item.color} key={item.key} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      contentStyle={chartTooltipStyle}
+                      formatter={(value, name) => {
+                        const count = Number(value);
+                        const percent = totalAttendanceEmployees
+                          ? Math.round((count / totalAttendanceEmployees) * 100)
+                          : 0;
+
+                        return [`${count} employee${count === 1 ? "" : "s"} (${percent}%)`, name];
+                      }}
+                      labelStyle={chartTooltipTextStyle}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="flex h-full items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-sm text-slate-400">
+                  No attendance data available.
+                </div>
+              )}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
+              {attendancePieData.map((item) => {
+                const percent = totalAttendanceEmployees
+                  ? Math.round((item.value / totalAttendanceEmployees) * 100)
+                  : 0;
+
+                return (
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4" key={item.key}>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="h-3.5 w-3.5 shrink-0 rounded-full" style={{ backgroundColor: item.color }} />
+                        <p className="truncate text-sm font-semibold text-white">{item.label}</p>
+                      </div>
+                      <p className="shrink-0 text-sm font-semibold text-slate-300">{percent}%</p>
+                    </div>
+                    <p className="mt-3 text-2xl font-semibold text-white">{item.value}</p>
+                    <p className="mt-0.5 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                      Employees
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </SectionCard>
+      </div>
 
       <SectionCard title="Attendance Status">
         <div className="overflow-x-auto">
@@ -2122,34 +2242,48 @@ function ActivityView({
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(normalizedSearch));
   };
+  const activitySignalRowMatchesSearch = (row: SessionUsageRow) => {
+    if (!normalizedSearch) {
+      return true;
+    }
+
+    return [row.employeeName, row.employeeCode, row.department]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(normalizedSearch));
+  };
   const selectedSessionRows = sessionUsageRows.filter((row) => {
     const loginDate = row.loginAt ? formatDateParam(new Date(row.loginAt)) : "";
-    const logoutDate = row.logoutAt ? formatDateParam(new Date(row.logoutAt)) : "";
-    return loginDate === selectedDate || logoutDate === selectedDate;
+    return loginDate === selectedDate;
   });
   const visibleSessionRows = selectedSessionRows.filter(sessionRowMatchesSearch);
   const visibleCurrentLoginAppRows = currentLoginAppUsageRows.filter(sessionRowMatchesSearch);
-  const activityByUser = selectedSessionRows.reduce((map, row) => {
-    const current = map.get(row.userId) || { keyboard: 0, mouse: 0 };
-    current.keyboard += row.productiveMinutes || 0;
-    current.mouse += row.idleMinutes || 0;
-    map.set(row.userId, current);
-    return map;
-  }, new Map<number, { keyboard: number; mouse: number }>());
-  const fallbackActivityByName = new Map(chartData.map((item) => [item.hour, item]));
-  const chartRows = rows.map((employee) => {
-    const activity = typeof employee.id === "number"
-      ? activityByUser.get(employee.id)
-      : fallbackActivityByName.get(employee.name);
-    const isHighlighted = employeeMatchesSearch(employee);
+  const visibleActivitySignalRows = selectedSessionRows.filter(activitySignalRowMatchesSearch);
+  const uniqueSessionRows = Array.from(
+    visibleActivitySignalRows
+      .reduce((map, row) => {
+        if (!map.has(row.sessionId)) {
+          map.set(row.sessionId, row);
+        }
 
-    return {
-      hour: employee.name,
-      keyboard: normalizedSearch && !isHighlighted ? 0 : activity?.keyboard ?? 0,
-      mouse: normalizedSearch && !isHighlighted ? 0 : activity?.mouse ?? 0,
-      isHighlighted,
-    };
-  });
+        return map;
+      }, new Map<number, SessionUsageRow>())
+      .values(),
+  );
+  const productiveActivityMinutes = uniqueSessionRows.reduce((sum, row) => sum + row.productiveMinutes, 0);
+  const idleActivityMinutes = uniqueSessionRows.reduce((sum, row) => sum + row.idleMinutes, 0);
+  const breakActivityMinutes = uniqueSessionRows.reduce((sum, row) => sum + row.breakMinutes, 0);
+  const nonWorkingActivityMinutes = uniqueSessionRows.reduce(
+    (sum, row) => sum + row.unproductiveMinutes,
+    0,
+  );
+  const activityPieData = [
+    { key: "productive", label: "Productive Time", value: productiveActivityMinutes, color: "#22d3ee" },
+    { key: "idle", label: "Idle Time", value: idleActivityMinutes, color: "#34d399" },
+    { key: "non-working", label: "Unproductive Time", value: nonWorkingActivityMinutes, color: "#fb7185" },
+    { key: "break", label: "Break Time", value: breakActivityMinutes, color: "#f59e0b" },
+  ];
+  const visibleActivityPieData = activityPieData.filter((item) => item.value > 0);
+  const totalActivityMinutes = activityPieData.reduce((sum, item) => sum + item.value, 0);
   const activeSessions = visibleSessionRows.filter((row) => row.sessionStatus === "ACTIVE").length;
   const trackedEmployees = new Set(visibleSessionRows.map((row) => row.userId)).size || (normalizedSearch ? 0 : rows.length);
   const idleMinutes = visibleSessionRows.reduce((sum, row) => sum + row.idleMinutes, 0);
@@ -2159,36 +2293,68 @@ function ActivityView({
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
         <SectionCard title="Recorded Activity Signals">
           <p className="mb-4 text-sm text-slate-400">
-            Showing tracked productive and idle minutes for {formatDateInputDisplay(selectedDate)}.
+            Showing tracked time split for {formatDateInputDisplay(selectedDate)}.
           </p>
-          <div className="h-80">
-            <ResponsiveContainer height="100%" width="100%">
-              <BarChart data={chartRows} margin={barChartMargin}>
-                <CartesianGrid stroke="#1e293b" strokeDasharray="4 4" />
-                <XAxis dataKey="hour" padding={barXAxisPadding} stroke="#94a3b8" />
-                <YAxis stroke="#94a3b8" />
-                <Tooltip
-                  contentStyle={chartTooltipStyle}
-                  labelStyle={chartTooltipTextStyle}
-                />
-                <Bar dataKey="keyboard" fill="#22d3ee" name="Productive Time" radius={[6, 6, 0, 0]}>
-                  {chartRows.map((item) => (
-                    <Cell
-                      fill={normalizedSearch ? (item.isHighlighted ? "#22d3ee" : "#334155") : "#22d3ee"}
-                      key={`${item.hour}-productive`}
+          <div className="grid items-center gap-6 lg:grid-cols-[minmax(300px,1fr)_260px]">
+            <div className="h-80">
+              {totalActivityMinutes > 0 ? (
+                <ResponsiveContainer height="100%" width="100%">
+                  <PieChart>
+                    <Pie
+                      cx="50%"
+                      cy="50%"
+                      data={visibleActivityPieData}
+                      dataKey="value"
+                      innerRadius={68}
+                      label={false}
+                      labelLine={false}
+                      nameKey="label"
+                      outerRadius={122}
+                      paddingAngle={3}
+                    >
+                      {visibleActivityPieData.map((item) => (
+                        <Cell fill={item.color} key={item.key} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      contentStyle={chartTooltipStyle}
+                      formatter={(value, name) => {
+                        const minutes = Number(value);
+                        const percent = totalActivityMinutes
+                          ? Math.round((minutes / totalActivityMinutes) * 100)
+                          : 0;
+
+                        return [`${formatMinutes(minutes)} (${percent}%)`, name];
+                      }}
+                      labelStyle={chartTooltipTextStyle}
                     />
-                  ))}
-                </Bar>
-                <Bar dataKey="mouse" fill="#34d399" name="Idle Time" radius={[6, 6, 0, 0]}>
-                  {chartRows.map((item) => (
-                    <Cell
-                      fill={normalizedSearch ? (item.isHighlighted ? "#34d399" : "#475569") : "#34d399"}
-                      key={`${item.hour}-idle`}
-                    />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+                  </PieChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="flex h-full items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-sm text-slate-400">
+                  No activity data available.
+                </div>
+              )}
+            </div>
+
+            <div className="grid gap-3">
+              {activityPieData.map((item) => {
+                const percent = totalActivityMinutes ? Math.round((item.value / totalActivityMinutes) * 100) : 0;
+
+                return (
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4" key={item.key}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="h-3.5 w-3.5 shrink-0 rounded-full" style={{ backgroundColor: item.color }} />
+                        <p className="truncate text-sm font-semibold text-white">{item.label}</p>
+                      </div>
+                      <p className="shrink-0 text-xs font-semibold text-slate-400">{percent}%</p>
+                    </div>
+                    <p className="mt-2 text-xl font-semibold text-white">{formatMinutes(item.value)}</p>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </SectionCard>
 
@@ -2229,6 +2395,7 @@ function ScreenshotsView({
   const [selectedEmployeeId, setSelectedEmployeeId] = useState("");
   const [showIdleOnly, setShowIdleOnly] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [selectedScreenshot, setSelectedScreenshot] = useState<EmployeeScreenshot | null>(null);
   const idleBorderLabel = "Idle > 5 min";
 
   useEffect(() => {
@@ -2281,7 +2448,9 @@ function ScreenshotsView({
   }, [selectedDate, selectedEmployeeId, showIdleOnly]);
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
+    <>
+      <div className="grid items-start gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
+      <div className="xl:sticky xl:top-6">
       <SectionCard title="Screenshot Filters">
         <div className="space-y-4">
           <div>
@@ -2328,8 +2497,10 @@ function ScreenshotsView({
           </button>
         </div>
       </SectionCard>
+      </div>
 
       <SectionCard title={showIdleOnly ? "Idle Screenshots" : selectedEmployeeId ? "Employee Screenshots" : "Captured Screenshots"}>
+        <div className="max-h-[calc(100vh-220px)] overflow-y-auto pr-2">
         {isLoading ? (
           <p className="text-sm text-slate-400">Loading screenshots...</p>
         ) : screenshots.length > 0 ? (
@@ -2339,12 +2510,20 @@ function ScreenshotsView({
 
               return (
                 <article
-                  className={`overflow-hidden rounded-2xl border-2 bg-white/5 ${
+                  className={`cursor-zoom-in overflow-hidden rounded-2xl border-2 bg-white/5 transition hover:bg-white/10 ${
                     item.isIdle
                       ? "border-rose-500 shadow-[0_0_0_3px_rgba(244,63,94,0.35)]"
                       : "border-white/10"
                   }`}
                   key={item.id}
+                  onClick={() => setSelectedScreenshot(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      setSelectedScreenshot(item);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                 >
                   <img
                     alt={`${employeeName} screenshot captured ${formatFullDateTime(item.capturedAt)}`}
@@ -2385,8 +2564,46 @@ function ScreenshotsView({
                 : "No screenshots captured yet."}
           </p>
         )}
+        </div>
       </SectionCard>
-    </div>
+      </div>
+      {selectedScreenshot && (
+        <div
+          className="fixed inset-0 z-50 flex flex-col bg-slate-950/95 p-4 text-white backdrop-blur"
+          onClick={() => setSelectedScreenshot(null)}
+          role="presentation"
+        >
+          <div className="mb-3 flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold">
+                {selectedScreenshot.user.firstName} {selectedScreenshot.user.lastName}
+              </p>
+              <p className="truncate text-xs text-slate-400">
+                {formatFullDateTime(selectedScreenshot.capturedAt)}
+                {(selectedScreenshot.appName || selectedScreenshot.windowTitle)
+                  ? ` | ${selectedScreenshot.appName || "Unknown app"}${selectedScreenshot.windowTitle ? ` - ${selectedScreenshot.windowTitle}` : ""}`
+                  : ""}
+              </p>
+            </div>
+            <button
+              className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/10 text-xl font-semibold text-white hover:bg-white/15"
+              onClick={() => setSelectedScreenshot(null)}
+              type="button"
+            >
+              x
+            </button>
+          </div>
+          <div className="flex min-h-0 flex-1 items-center justify-center">
+            <img
+              alt="Selected employee screenshot"
+              className="max-h-full max-w-full rounded-xl object-contain"
+              onClick={(event) => event.stopPropagation()}
+              src={selectedScreenshot.imageDataUrl}
+            />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -34,6 +34,7 @@ const FIRST_BREAK_ALLOWANCE_MINUTES = 45;
 const SECOND_BREAK_ALLOWANCE_MINUTES = 15;
 const DEFAULT_BREAK_ALLOWANCE_MINUTES = FIRST_BREAK_ALLOWANCE_MINUTES + SECOND_BREAK_ALLOWANCE_MINUTES;
 const IDLE_THRESHOLD_MINUTES = 5;
+const SCREENSHOT_INTERVAL_MINUTES = 10;
 
 type AuthUser = {
   id: number;
@@ -161,6 +162,14 @@ function productivityPercent(productiveMinutes: number, loginMinutes: number) {
   return Math.min(100, Math.round((productiveMinutes / loginMinutes) * 100));
 }
 
+function productivityPercentFromSeconds(productiveSeconds: number, loginSeconds: number) {
+  if (loginSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.min(100, Math.round((productiveSeconds / loginSeconds) * 100));
+}
+
 function productiveMinutesWithBreakAllowance(
   loginMinutes: number,
   idleMinutes: number,
@@ -170,6 +179,17 @@ function productiveMinutesWithBreakAllowance(
 ) {
   const breakOverage = excessBreakMinutes ?? Math.max(0, breakMinutes - breakAllowanceMinutes);
   return Math.max(0, loginMinutes - idleMinutes - breakOverage);
+}
+
+function productiveSecondsWithBreakAllowance(
+  loginSeconds: number,
+  idleSeconds: number,
+  breakSeconds: number,
+  breakAllowanceMinutes = DEFAULT_BREAK_ALLOWANCE_MINUTES,
+  excessBreakSeconds?: number,
+) {
+  const breakOverageSeconds = excessBreakSeconds ?? Math.max(0, breakSeconds - breakAllowanceMinutes * 60);
+  return Math.max(0, loginSeconds - idleSeconds - breakOverageSeconds);
 }
 
 async function getBreakAllowanceMinutes() {
@@ -1466,10 +1486,17 @@ app.get(
     if (!session) {
       res.json({
         date: requestedDate,
+        generatedAt: new Date(),
         sessionId: null,
         loginTime: null,
+        totalSeconds: 0,
+        activeSeconds: 0,
+        idleSeconds: 0,
+        breakSeconds: 0,
+        productiveSeconds: 0,
         activeMinutes: 0,
         idleMinutes: 0,
+        breakMinutes: 0,
         productiveMinutes: 0,
         productivity: 0,
         attendance: "NOT_MARKED",
@@ -1507,30 +1534,15 @@ app.get(
       },
     });
 
-    let idleMinutes = 0;
-    let idleStart: Date | null = null;
-
-    for (const event of events) {
-      if (event.type === "IDLE_START") {
-        idleStart = event.createdAt;
-      }
-
-      if (
-        event.type === "IDLE_END" &&
-        idleStart
-      ) {
-        idleMinutes += Math.floor(
-          (event.createdAt.getTime() -
-            idleStart.getTime()) /
-            60000
-        );
-
-        idleStart = null;
-      }
-    }
-
-    const nonWorkingUsageMinutes = Math.round(
-      events.reduce((sum, event) => {
+    const endTime =
+      session.logoutAt || new Date();
+    const idleSecondsFromEvents = secondsFromEventPairs(
+      events,
+      TrackingEventType.IDLE_START,
+      TrackingEventType.IDLE_END,
+      endTime,
+    );
+    const nonWorkingUsageSeconds = events.reduce((sum, event) => {
         if (event.type !== TrackingEventType.APP_USAGE) {
           return sum;
         }
@@ -1542,26 +1554,27 @@ app.get(
         }
 
         return sum + (event.durationSeconds ?? 0);
-      }, 0) / 60,
-    );
-
-    const endTime =
-      session.logoutAt || new Date();
-
-    const totalMinutes = Math.floor(
-      (endTime.getTime() -
-        session.loginAt.getTime()) /
-        60000
-    );
+      }, 0);
+    const nonWorkingUsageMinutes = Math.round(nonWorkingUsageSeconds / 60);
+    const totalSeconds = Math.max(0, Math.round((endTime.getTime() - session.loginAt.getTime()) / 1000));
+    const totalMinutes = Math.floor(totalSeconds / 60);
 
     const breakAllowanceMinutes = await getBreakAllowanceMinutes();
     const breakUsage = breakAllowanceFromEvents(events, endTime, session.breakMinutes);
     const breakMinutes = Math.max(session.breakMinutes, breakUsage.totalBreakMinutes);
-    const rawIdleMinutes = idleMinutes;
-    idleMinutes += breakUsage.excessBreakMinutes;
+    const rawIdleSeconds = Math.max(session.idleMinutes * 60, idleSecondsFromEvents);
+    const rawIdleMinutes = Math.round(rawIdleSeconds / 60);
+    const breakSeconds = breakMinutes * 60;
+    const excessBreakSeconds = breakUsage.excessBreakMinutes * 60;
+    const idleSeconds = rawIdleSeconds + excessBreakSeconds;
+    const idleMinutes = Math.round(idleSeconds / 60);
     const activeMinutes = Math.max(
       0,
       totalMinutes - rawIdleMinutes - breakMinutes - nonWorkingUsageMinutes,
+    );
+    const activeSeconds = Math.max(
+      0,
+      totalSeconds - rawIdleSeconds - breakSeconds - nonWorkingUsageSeconds,
     );
     const productiveMinutes = Math.max(
       0,
@@ -1573,17 +1586,35 @@ app.get(
         breakUsage.excessBreakMinutes,
       ) - nonWorkingUsageMinutes,
     );
+    const productiveSeconds = Math.max(
+      0,
+      productiveSecondsWithBreakAllowance(
+        totalSeconds,
+        rawIdleSeconds,
+        breakSeconds,
+        breakAllowanceMinutes,
+        excessBreakSeconds,
+      ) - nonWorkingUsageSeconds,
+    );
 
-    const productivity = productivityPercent(productiveMinutes, totalMinutes);
+    const productivity = productivityPercentFromSeconds(productiveSeconds, totalSeconds);
+    const useSavedRecord = session.status === SessionStatus.COMPLETED && productivityRecord;
 
     res.json({
       date: requestedDate,
+      generatedAt: endTime,
       sessionId: session.id,
       loginTime: session.loginAt,
-      activeMinutes: productivityRecord?.activeMinutes ?? activeMinutes,
-      idleMinutes: productivityRecord?.idleMinutes ?? idleMinutes,
-      productiveMinutes: productivityRecord?.productiveMinutes ?? productiveMinutes,
-      productivity: productivityRecord?.productivityPercent ?? productivity,
+      totalSeconds,
+      activeSeconds: useSavedRecord ? productivityRecord.activeMinutes * 60 : activeSeconds,
+      idleSeconds: useSavedRecord ? productivityRecord.idleMinutes * 60 : idleSeconds,
+      breakSeconds,
+      productiveSeconds: useSavedRecord ? productivityRecord.productiveMinutes * 60 : productiveSeconds,
+      activeMinutes: useSavedRecord ? productivityRecord.activeMinutes : activeMinutes,
+      idleMinutes: useSavedRecord ? productivityRecord.idleMinutes : idleMinutes,
+      breakMinutes,
+      productiveMinutes: useSavedRecord ? productivityRecord.productiveMinutes : productiveMinutes,
+      productivity: useSavedRecord ? productivityRecord.productivityPercent : productivity,
       attendance: attendanceRecord?.status ?? "NOT_MARKED",
       isFinalized: session.status === SessionStatus.COMPLETED,
     });
@@ -1677,12 +1708,50 @@ app.post("/api/screenshots", authenticate, asyncHandler(async (req, res) => {
     return;
   }
 
+  const requestedCapturedAt = capturedAt ? new Date(capturedAt) : new Date();
+
+  if (!Number.isFinite(requestedCapturedAt.getTime())) {
+    res.status(400).json({ message: "Invalid screenshot capture time" });
+    return;
+  }
+
+  const screenshotIntervalMs = SCREENSHOT_INTERVAL_MINUTES * 60 * 1000;
+  const firstAllowedAt = new Date(session.loginAt.getTime() + screenshotIntervalMs);
+
+  if (requestedCapturedAt.getTime() < firstAllowedAt.getTime()) {
+    res.status(409).json({
+      message: `First screenshot is allowed ${SCREENSHOT_INTERVAL_MINUTES} minutes after login`,
+      nextAllowedAt: firstAllowedAt,
+    });
+    return;
+  }
+
+  const latestScreenshot = await prisma.employeeScreenshot.findFirst({
+    where: {
+      userId: user.id,
+      sessionId: session.id,
+    },
+    orderBy: { capturedAt: "desc" },
+    select: { capturedAt: true },
+  });
+
+  if (
+    latestScreenshot &&
+    requestedCapturedAt.getTime() - latestScreenshot.capturedAt.getTime() < screenshotIntervalMs
+  ) {
+    res.status(409).json({
+      message: `Screenshots are allowed only every ${SCREENSHOT_INTERVAL_MINUTES} minutes`,
+      nextAllowedAt: new Date(latestScreenshot.capturedAt.getTime() + screenshotIntervalMs),
+    });
+    return;
+  }
+
   const screenshot = await prisma.employeeScreenshot.create({
     data: {
       userId: user.id,
       sessionId: session.id,
       imageDataUrl,
-      capturedAt: capturedAt ? new Date(capturedAt) : new Date(),
+      capturedAt: requestedCapturedAt,
       isIdle: Boolean(isIdle),
       appName: appName ? String(appName) : null,
       windowTitle: windowTitle ? String(windowTitle) : null,
@@ -2832,7 +2901,10 @@ app.post("/api/leave-requests", authenticate, asyncHandler(async (req, res) => {
   }
 
   const leaveDays = Number(days);
-  const leaveType = String(type).toUpperCase() === LeaveType.CASUAL ? LeaveType.CASUAL : LeaveType.SICK;
+  const requestedLeaveType = String(type).toUpperCase();
+  const leaveType = Object.values(LeaveType).includes(requestedLeaveType as LeaveType)
+    ? requestedLeaveType as LeaveType
+    : LeaveType.SICK;
 
   if (!reason || !Number.isInteger(leaveDays) || leaveDays <= 0) {
     res.status(400).json({ message: "Reason and valid leave days are required" });
