@@ -764,6 +764,7 @@ export default function DashboardPage() {
   const [attendanceDate, setAttendanceDate] = useState(formatDateParam());
   const [activityDate, setActivityDate] = useState(formatDateParam());
   const [screenshotDate, setScreenshotDate] = useState("");
+  const [screenshotDepartment, setScreenshotDepartment] = useState("");
   const [isReportCalendarOpen, setIsReportCalendarOpen] = useState(false);
   const effectiveAttendanceDate = attendanceDate || formatDateParam();
 
@@ -1107,6 +1108,9 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
     setActiveTab(tabId);
     setSearchQuery("");
     setIsReportCalendarOpen(false);
+    if (tabId !== "screenshots") {
+      setScreenshotDepartment("");
+    }
 
     if (tabId === "employees") {
       setSelectedEmployee(null);
@@ -1313,22 +1317,36 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
                     )}
                   </div>
                 )}
-                <div className="flex h-10 min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 sm:w-80">
-                  <Search size={18} className="shrink-0 text-slate-400" />
-                  <input
-                    className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
-                    onChange={(event) => setSearchQuery(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        handleSearchSubmit();
-                      }
-                    }}
-                    placeholder="Search employee name, ID, or department"
-                    type="text"
-                    value={searchQuery}
-                  />
-                </div>
-                {searchQuery && (
+                {activeTab === "screenshots" ? (
+                  <div className="flex h-10 min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 sm:w-80">
+                    <Search size={18} className="shrink-0 text-slate-400" />
+                    <input
+                      aria-label="Search screenshots by department"
+                      className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
+                      onChange={(event) => setScreenshotDepartment(event.target.value)}
+                      placeholder="Search by department"
+                      type="text"
+                      value={screenshotDepartment}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex h-10 min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-white/6 px-3 sm:w-80">
+                    <Search size={18} className="shrink-0 text-slate-400" />
+                    <input
+                      className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          handleSearchSubmit();
+                        }
+                      }}
+                      placeholder="Search employee name, ID, or department"
+                      type="text"
+                      value={searchQuery}
+                    />
+                  </div>
+                )}
+                {activeTab !== "screenshots" && searchQuery && (
                   <button
                     className="h-10 rounded-xl border border-cyan-300/20 bg-cyan-300/10 px-3 text-sm font-semibold text-cyan-100 hover:bg-cyan-300/15"
                     onClick={activeTab === "activity" ? () => setSearchQuery("") : handleSearchSubmit}
@@ -1538,7 +1556,9 @@ const [appUsageRows, setAppUsageRows] = useState<AppUsageRow[]>([]);
             {activeTab === "workflow" && <WorkflowView currentUser={currentUser} items={workflowItems} />}
             {activeTab === "screenshots" && (
               <ScreenshotsView
+                department={screenshotDepartment}
                 onSelectedDateChange={setScreenshotDate}
+                onSelectedDepartmentChange={setScreenshotDepartment}
                 rows={employeeRows}
                 selectedDate={screenshotDate}
               />
@@ -2307,14 +2327,34 @@ function ActivityView({
   const activeSessions = visibleSessionRows.filter((row) => row.sessionStatus === "ACTIVE").length;
   const trackedEmployees = new Set(visibleSessionRows.map((row) => row.userId)).size || (normalizedSearch ? 0 : rows.length);
   const idleMinutes = visibleSessionRows.reduce((sum, row) => sum + row.idleMinutes, 0);
+  const matchedEmployees = normalizedSearch ? rows.filter(employeeMatchesSearch) : [];
+  const matchedDepartments = Array.from(new Set(matchedEmployees.map((employee) => employee.department || "Unassigned")));
+  const activitySearchDetail = normalizedSearch
+    ? matchedEmployees.length === 1
+      ? `${matchedEmployees[0].name}${matchedEmployees[0].employeeCode ? ` (${matchedEmployees[0].employeeCode})` : ""} | ${
+          matchedEmployees[0].department || "Unassigned"
+        }`
+      : matchedDepartments.length === 1 && matchedEmployees.length > 1
+        ? `${matchedDepartments[0]} department`
+        : matchedEmployees.length > 1
+          ? `${matchedEmployees.length} employees matched`
+          : `No match for "${searchQuery.trim()}"`
+    : "";
 
   return (
     <div className="space-y-6">
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
         <SectionCard title="Recorded Activity Signals">
-          <p className="mb-4 text-sm text-slate-400">
-            Showing tracked time split for {formatDateInputDisplay(selectedDate)}.
-          </p>
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1.5 text-xs font-semibold text-cyan-100">
+              {formatDateInputDisplay(selectedDate)}
+            </span>
+            {activitySearchDetail && (
+              <span className="rounded-full border border-white/10 bg-white/7 px-3 py-1.5 text-xs font-semibold text-slate-200">
+                {activitySearchDetail}
+              </span>
+            )}
+          </div>
           <div className="grid items-center gap-6 lg:grid-cols-[minmax(300px,1fr)_260px]">
             <div className="h-80">
               {totalActivityMinutes > 0 ? (
@@ -2403,11 +2443,15 @@ function ActivityView({
 }
 
 function ScreenshotsView({
+  department,
   onSelectedDateChange,
+  onSelectedDepartmentChange,
   rows = [],
   selectedDate,
 }: {
+  department: string;
   onSelectedDateChange: (date: string) => void;
+  onSelectedDepartmentChange: (department: string) => void;
   rows?: EmployeeRow[];
   selectedDate: string;
 }) {
@@ -2435,6 +2479,11 @@ function ScreenshotsView({
 
         if (selectedEmployeeId) {
           params.set("userId", selectedEmployeeId);
+        }
+
+        if (department) {
+          params.set("department", department);
+          params.set("limit", "100");
         }
 
         if (showIdleOnly) {
@@ -2465,7 +2514,15 @@ function ScreenshotsView({
       isCurrent = false;
       window.clearInterval(interval);
     };
-  }, [selectedDate, selectedEmployeeId, showIdleOnly]);
+  }, [department, selectedDate, selectedEmployeeId, showIdleOnly]);
+
+  const sectionTitle = showIdleOnly
+    ? "Idle Screenshots"
+    : selectedEmployeeId
+      ? "Employee Screenshots"
+      : department
+        ? `${department} Screenshots`
+        : "Captured Screenshots";
 
   return (
     <>
@@ -2509,6 +2566,7 @@ function ScreenshotsView({
             onClick={() => {
               setSelectedEmployeeId("");
               onSelectedDateChange("");
+              onSelectedDepartmentChange("");
               setShowIdleOnly(false);
             }}
             type="button"
@@ -2519,7 +2577,7 @@ function ScreenshotsView({
       </SectionCard>
       </div>
 
-      <SectionCard title={showIdleOnly ? "Idle Screenshots" : selectedEmployeeId ? "Employee Screenshots" : "Captured Screenshots"}>
+      <SectionCard title={sectionTitle}>
         <div className="max-h-[calc(100vh-220px)] overflow-y-auto pr-2">
         {isLoading ? (
           <p className="text-sm text-slate-400">Loading screenshots...</p>
@@ -2579,6 +2637,8 @@ function ScreenshotsView({
               ? "No screenshots captured for this employee on the selected date."
               : showIdleOnly
                 ? "No idle screenshots have been captured yet."
+                : department
+                  ? "No screenshots captured for this department."
               : selectedDate
                 ? "No screenshots captured on the selected date."
                 : "No screenshots captured yet."}
